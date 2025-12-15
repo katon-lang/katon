@@ -75,7 +75,7 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::otter;
-    use super::ast::{Expr, FnDecl, Op, Stmt};
+    use super::ast::{Expr, Op, Stmt};
 
     fn int(i: i64) -> Box<Expr> { Box::new(Expr::IntLit(i)) }
     fn var(s: &str) -> Box<Expr> { Box::new(Expr::Var(s.to_string())) }
@@ -110,5 +110,78 @@ mod tests {
             Op::Mul, 
             int(3)
         ));
+    }
+
+    #[test]
+    fn test_factor_and_atoms() {
+        let parser = otter::ExprParser::new();
+
+        assert_eq!(parser.parse("(123)").unwrap(), Expr::IntLit(123));
+
+        // Negative numbers (unary minus)
+        // "-5" parses as "0 - 5" based on your grammar rule: "-" <f:Factor> => 0 - f
+        assert_eq!(parser.parse("-5").unwrap(), bin(int(0), Op::Sub, int(5)));
+
+        assert_eq!(parser.parse("old(balance)").unwrap(), Expr::Old("balance".to_string()));
+    }
+
+    #[test]
+    fn test_statements() {
+        let parser = otter::StmtParser::new();
+
+        // Assignment
+        let assign = parser.parse("x = 100").unwrap();
+        match assign {
+            Stmt::Assign { target, value } => {
+                assert_eq!(target, "x");
+                assert_eq!(value, Expr::IntLit(100));
+            },
+            _ => panic!("Expected Assign"),
+        }
+
+        // If-Else
+        let if_stmt = parser.parse("if x > 0 { y = 1 } else { y = 2 }").unwrap();
+        match if_stmt {
+            Stmt::If { cond, then_block, else_block } => {
+                assert!(matches!(cond, Expr::Binary(..)));
+                assert_eq!(then_block.len(), 1);
+                assert_eq!(else_block.len(), 1);
+            },
+            _ => panic!("Expected If"),
+        }
+        
+        // If without Else (should have empty else_block)
+        let if_only = parser.parse("if x > 0 { y = 1 }").unwrap();
+        match if_only {
+            Stmt::If { else_block, .. } => {
+                assert!(else_block.is_empty());
+            },
+            _ => panic!("Expected If"),
+        }
+    }
+
+    #[test]
+    fn test_function_decl() {
+        let parser = otter::FnDeclParser::new();
+
+        let code = r#"
+            func transfer(from, to, amount) {
+                requires amount > 0
+                requires from > amount
+                
+                from = from - amount
+                to = to + amount
+
+                ensures to > old(to)
+            }
+        "#;
+
+        let func = parser.parse(code).unwrap();
+
+        assert_eq!(func.name, "transfer");
+        assert_eq!(func.params, vec!["from", "to", "amount"]);
+        assert_eq!(func.requires.len(), 2); // Two requires statements
+        assert_eq!(func.body.len(), 2);     // Two assignments
+        assert_eq!(func.ensures.len(), 1);  // One ensures statement
     }
 }
