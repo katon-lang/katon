@@ -6,6 +6,12 @@ pub struct BorrowChecker {
     scope: HashMap<String, bool>, // Name -> IsAlive?
 }
 
+impl Default for BorrowChecker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl BorrowChecker {
     pub fn new() -> Self {
         Self {
