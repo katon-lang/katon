@@ -50,6 +50,11 @@ fn expr_to_smt(expr: &Expr, env: &Env) -> String {
                 Op::Eq => "=",
                 Op::Gt => ">",
                 Op::Lt => "<",
+                Op::Gte => ">=",
+                Op::Lte => "<=",
+                Op::Mul => "*",
+                Op::Neq => "!=",
+                Op::Div => "/",
             };
             format!("({} {} {})", op_str, l, r)
         }

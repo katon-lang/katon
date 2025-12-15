@@ -1,0 +1,108 @@
+use std::str::FromStr;
+use crate::ast::{Expr, FnDecl, Op, Stmt};
+
+grammar;
+
+// ===========================================
+// 1. Expressions (Pratt Logic / Precedence)
+// ===========================================
+
+// Tier 1: Lowest precedence (Comparisons)
+pub Expr: Expr = {
+    <l:Expr> "==" <r:Term> => Expr::Binary(Box::new(l), Op::Eq, Box::new(r)),
+    <l:Expr> ">"  <r:Term> => Expr::Binary(Box::new(l), Op::Gt, Box::new(r)),
+    <l:Expr> "<"  <r:Term> => Expr::Binary(Box::new(l), Op::Lt, Box::new(r)),
+    <l:Expr> ">=" <r:Term> => Expr::Binary(Box::new(l), Op::Gte, Box::new(r)),
+    <l:Expr> "<=" <r:Term> => Expr::Binary(Box::new(l), Op::Lte, Box::new(r)),
+    Term,
+};
+
+// Tier 2: Arithmetic (+, -)
+Term: Expr = {
+    <l:Term> "+" <r:Factor> => Expr::Binary(Box::new(l), Op::Add, Box::new(r)),
+    <l:Term> "-" <r:Factor> => Expr::Binary(Box::new(l), Op::Sub, Box::new(r)),
+    <l:Term> "*" <r:Factor> => Expr::Binary(Box::new(l), Op::Mul, Box::new(r)),
+    <l:Term> "/" <r:Factor> => Expr::Binary(Box::new(l), Op::Div, Box::new(r)),
+    Factor,
+};
+
+// Tier 3: Highest precedence (Atoms)
+Factor: Expr = {
+    <i:Int> => Expr::IntLit(i),
+    <id:Ident> => Expr::Var(id),
+    "-" <f:Factor> => Expr::Binary(Box::new(Expr::IntLit(0)), Op::Sub, Box::new(f)),
+    "old" "(" <id:Ident> ")" => Expr::Old(id),
+    "(" <e:Expr> ")" => e,
+};
+
+// ===========================================
+// 2. Statements
+// ===========================================
+
+pub Stmt: Stmt = {
+    // Assignment: x = 5
+    <id:Ident> "=" <e:Expr> => Stmt::Assign { target: id, value: e },
+
+    // If Statement
+    "if" <cond:Expr> <then_block:Block> <else_block:("else" <Block>)?> => {
+        Stmt::If {
+            cond,
+            then_block,
+            else_block: else_block.unwrap_or(vec![]), // Handle optional else
+        }
+    },
+};
+
+// A block is just a list of statements wrapped in curly braces
+Block: Vec<Stmt> = {
+    "{" <s:Stmt*> "}" => s
+};
+
+// ===========================================
+// 3. Function Declaration
+// ===========================================
+
+// Helper for "requires" and "ensures"
+Requires: Expr = "requires" <e:Expr> => e;
+Ensures: Expr = "ensures" <e:Expr> => e;
+
+// Comma separated identifiers: x, y, z
+Params: Vec<String> = {
+    <mut v:(<Ident> ",")*> <e:Ident?> => match e {
+        None => v,
+        Some(e) => {
+            v.push(e);
+            v
+        }
+    }
+};
+
+pub FnDecl: FnDecl = {
+    "func" <name:Ident> "(" <params:Params> ")" "{" 
+        <req:Requires*>   // 0 or more 'requires'
+        <body:Stmt*>      // 0 or more statements
+        <ens:Ensures*>    // 0 or more 'ensures'
+    "}" => FnDecl {
+        name,
+        params,
+        requires: req,
+        ensures: ens,
+        body,
+    }
+};
+
+// ===========================================
+// 4. Lexer / Terminals
+// ===========================================
+
+// Simple tokens
+Int: i64 = <s:r"[0-9]+"> => i64::from_str(s).unwrap();
+Ident: String = <s:r"[a-zA-Z_][a-zA-Z0-9_]*"> => s.to_string();
+
+// Ignore whitespace
+match {
+    r"\s*" => { }, // The default whitespace skipping
+    r"//[^\n\r]*[\n\r]*" => { }, // Skip comments
+} else {
+    _
+}

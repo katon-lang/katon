@@ -2,9 +2,14 @@
 pub enum Op {
     Add,
     Sub,
+    Mul,
+    Div,
     Eq,
+    Neq,
     Gt,
     Lt,
+    Gte,
+    Lte,
 }
 
 #[derive(Debug, Clone)]
@@ -30,6 +35,7 @@ pub enum Stmt {
 }
 
 pub struct FnDecl {
+    pub name: String,
     pub params: Vec<String>,
     pub requires: Vec<Expr>,
     pub ensures: Vec<Expr>,
