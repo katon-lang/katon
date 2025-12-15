@@ -19,10 +19,14 @@ pub Expr: Expr = {
 
 // Tier 2: Arithmetic (+, -)
 pub Term: Expr = {
-    <l:Term> "+" <r:Factor> => Expr::Binary(Box::new(l), Op::Add, Box::new(r)),
-    <l:Term> "-" <r:Factor> => Expr::Binary(Box::new(l), Op::Sub, Box::new(r)),
-    <l:Term> "*" <r:Factor> => Expr::Binary(Box::new(l), Op::Mul, Box::new(r)),
-    <l:Term> "/" <r:Factor> => Expr::Binary(Box::new(l), Op::Div, Box::new(r)),
+    <l:Term> "+" <r:Product> => Expr::Binary(Box::new(l), Op::Add, Box::new(r)),
+    <l:Term> "-" <r:Product> => Expr::Binary(Box::new(l), Op::Sub, Box::new(r)),
+    Product,
+};
+
+pub Product: Expr = {
+    <l:Product> "*" <r:Factor> => Expr::Binary(Box::new(l), Op::Mul, Box::new(r)),
+    <l:Product> "/" <r:Factor> => Expr::Binary(Box::new(l), Op::Div, Box::new(r)),
     Factor,
 };
 
@@ -48,7 +52,7 @@ pub Stmt: Stmt = {
         Stmt::If {
             cond,
             then_block,
-            else_block: else_block.unwrap_or(vec![]), // Handle optional else
+            else_block: else_block.unwrap_or(vec![]),
         }
     },
 };
