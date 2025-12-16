@@ -75,6 +75,8 @@ mod tests {
     use super::ast::{Expr, FnDecl, Op, Stmt};
     use super::check::BorrowChecker;
     use super::otter;
+    use super::runner;
+    use super::vc;
 
     fn int(i: i64) -> Box<Expr> {
         Box::new(Expr::IntLit(i))
@@ -218,8 +220,8 @@ mod tests {
         };
 
         // This must PASS Z3
-        let smt = crate::vc::compile(&func);
-        let result = crate::runner::verify_with_z3(&smt);
+        let smt = vc::compile(&func);
+        let result = runner::verify_with_z3(&smt);
         assert!(
             result.is_ok(),
             "Vacuous truth failed: Impossible preconditions should verify anything."
@@ -305,8 +307,8 @@ mod tests {
             ensures: vec![bin(var("x"), Op::Eq, int(1))],
         };
 
-        let smt = crate::vc::compile(&func);
-        let result = crate::runner::verify_with_z3(&smt);
+        let smt = vc::compile(&func);
+        let result = runner::verify_with_z3(&smt);
         assert!(result.is_ok(), "Nested IF logic failed verification.");
     }
 
@@ -337,8 +339,8 @@ mod tests {
             ensures: vec![bin(var("z"), Op::Eq, var("x"))],
         };
 
-        let smt = crate::vc::compile(&func);
-        let result = crate::runner::verify_with_z3(&smt);
+        let smt = vc::compile(&func);
+        let result = runner::verify_with_z3(&smt);
         assert!(result.is_ok(), "Integer division logic failed.");
     }
 }
