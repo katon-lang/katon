@@ -30,7 +30,7 @@ pub fn verify_with_z3(smt_code: &str) -> Result<(), String> {
         .lines()
         .map(str::trim)
         .filter(|l| !l.is_empty())
-        .last()
+        .next_back()
         .ok_or("Z3 produced no output")?;
 
     match last {
