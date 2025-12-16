@@ -343,4 +343,45 @@ mod tests {
         let result = runner::verify_with_z3(&smt);
         assert!(result.is_ok(), "Integer division logic failed.");
     }
+
+    #[test]
+    fn test_bad_loop_entry() {
+        // func BadLoop(x) {
+        //    x = 0
+        //    // Invariant: x > 10.
+        //    // This fails immediately on entry because x is 0!
+        //    while x < 100 invariant x > 10 {
+        //       x = x + 1
+        //    }
+        // }
+        let func = FnDecl {
+            name: "BadLoop".to_string(),
+            params: vec!["x".to_string()],
+            requires: vec![],
+            ensures: vec![],
+            body: vec![
+                Stmt::Assign {
+                    target: "x".to_string(),
+                    value: Expr::IntLit(0),
+                },
+                Stmt::While {
+                    cond: bin(var("x"), Op::Lt, int(100)),
+                    invariant: bin(var("x"), Op::Gt, int(10)), // 0 > 10 is False
+                    body: vec![Stmt::Assign {
+                        target: "x".to_string(),
+                        value: bin(var("x"), Op::Add, int(1)),
+                    }],
+                },
+            ],
+        };
+
+        let smt = vc::compile(&func);
+        let result = runner::verify_with_z3(&smt);
+
+        // We EXPECT this to fail.
+        assert!(
+            result.is_err(),
+            "Verifier failed to catch invalid Loop Entry invariant"
+        );
+    }
 }
