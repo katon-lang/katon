@@ -10,6 +10,7 @@ pub enum Op {
     Lt,
     Gte,
     Lte,
+    Index,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -38,12 +39,18 @@ pub enum Stmt {
         invariant: Expr, // The user MUST use invariant for now
         body: Vec<Stmt>,
     },
+    ArrayUpdate {
+        target: String,
+        index: Expr,
+        value: Expr,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Type {
     Int,
     Nat,
+    Array(Box<Type>),
 }
 
 pub struct FnDecl {

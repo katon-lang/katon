@@ -68,6 +68,7 @@ fn expr_to_smt(expr: &Expr, env: &Env) -> String {
                 Op::Mul => "*",
                 Op::Neq => "distinct",
                 Op::Div => "div",
+                Op::Index => "select",
             };
             format!("({} {} {})", op_str, l, r)
         }
@@ -90,12 +91,20 @@ fn get_modified_vars(stmts: &[Stmt]) -> Vec<String> {
             Stmt::While { body, .. } => {
                 vars.extend(get_modified_vars(body));
             }
+            Stmt::ArrayUpdate { target, .. } => vars.push(target.clone()),
         }
     }
 
     vars.sort();
     vars.dedup(); // Remove duplicates
     vars
+}
+
+fn type_to_smt(ty: &Type) -> String {
+    match ty {
+        Type::Int | Type::Nat => "Int".to_string(),
+        Type::Array(inner) => format!("(Array Int {})", type_to_smt(inner)),
+    }
 }
 
 fn process_block(stmts: &[Stmt], env: &mut Env, smt: &mut String) {
@@ -116,7 +125,15 @@ fn process_block(stmts: &[Stmt], env: &mut Env, smt: &mut String) {
                 }
 
                 let new_target = env.new_version(target);
-                smt.push_str(&format!("(declare-const {} Int)\n", new_target));
+
+                // Get the type string (e.g., "Int" or "(Array Int Int)")
+                let ty_smt = if let Some(ty) = env.var_types.get(target) {
+                    type_to_smt(ty)
+                } else {
+                    "Int".to_string() // Fallback/Error
+                };
+
+                smt.push_str(&format!("(declare-const {} {})\n", new_target, ty_smt));
                 smt.push_str(&format!("(assert (= {} {}))\n", new_target, val_smt));
 
                 // Add the type constraint to the main path too, so future logic knows it's positive
@@ -219,22 +236,47 @@ fn process_block(stmts: &[Stmt], env: &mut Env, smt: &mut String) {
                 let cond_exit = expr_to_smt(cond, env);
                 smt.push_str(&format!("(assert (not {}))\n", cond_exit));
             }
+            Stmt::ArrayUpdate {
+                target,
+                index,
+                value,
+            } => {
+                let idx_smt = expr_to_smt(index, env);
+                let val_smt = expr_to_smt(value, env);
+                let current_arr = env.get(target);
+
+                // [STRICT] Bounds check would go here:
+                // (assert (>= idx 0))
+                // (assert (< idx len))
+
+                // Create new array version
+                let new_arr = env.new_version(target);
+                let ty_smt = type_to_smt(env.var_types.get(target).unwrap());
+
+                // Declare: (declare-const a_2 (Array Int Int))
+                smt.push_str(&format!("(declare-const {} {})\n", new_arr, ty_smt));
+
+                // Logic: (assert (= a_2 (store a_1 i v)))
+                smt.push_str(&format!(
+                    "(assert (= {} (store {} {} {})))\n",
+                    new_arr, current_arr, idx_smt, val_smt
+                ));
+            }
         }
     }
 }
 
 pub fn compile(func: &FnDecl) -> String {
-    let mut smt = String::from("(set-logic QF_NIA)\n");
+    let mut smt = String::from("(set-logic QF_AUFNIA)\n");
     let mut env = Env::new();
 
     for (name, ty) in &func.params {
-        // destructure (name, type)
-        env.register_var(name, ty.clone()); // Register type
+        env.register_var(name, ty.clone());
+        let ty_smt = type_to_smt(ty);
 
-        smt.push_str(&format!("(declare-const {}_0 Int)\n", name));
+        smt.push_str(&format!("(declare-const {}_0 {})\n", name, ty_smt));
         env.current_scope.insert(name.clone(), 0);
 
-        // [Strictness] If input is Nat, assert it is >= 0
         if let Type::Nat = ty {
             smt.push_str(&format!("(assert (>= {}_0 0))\n", name));
         }
@@ -412,7 +454,63 @@ mod tests {
         let smt = compile(&func);
         let result = verify_with_z3(&smt);
 
-        // This MUST fail. If it says "Ok", your verifier is broken.
+        // This MUST fail. If it says "Ok", the verifier is broken.
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_compile_array_update() {
+        // SCENARIO:
+        // func update(arr []int) {
+        //    arr[0] = 99
+        //    ensures arr[0] == 99
+        //    ensures arr[1] == old(arr)[1] // Frame property
+        // }
+
+        let func = FnDecl {
+            name: "update".to_string(),
+            params: vec![("arr".to_string(), Type::Array(Box::new(Type::Int)))],
+            requires: vec![],
+            body: vec![Stmt::ArrayUpdate {
+                target: "arr".to_string(),
+                index: Expr::IntLit(0),
+                value: Expr::IntLit(99),
+            }],
+            ensures: vec![
+                // arr[0] == 99
+                bin(
+                    Box::new(bin(var("arr"), Op::Index, int(0))),
+                    Op::Eq,
+                    int(99),
+                ),
+                // arr[1] == old(arr)[1] (Prove we didn't touch index 1)
+                bin(
+                    Box::new(bin(var("arr"), Op::Index, int(1))),
+                    Op::Eq,
+                    Box::new(Expr::Binary(
+                        Box::new(Expr::Old("arr".to_string())),
+                        Op::Index,
+                        int(1),
+                    )),
+                ),
+            ],
+        };
+
+        let smt = compile(&func);
+        println!("{}", smt);
+
+        // 1. Declare Array
+        assert!(smt.contains("(declare-const arr_0 (Array Int Int))"));
+
+        // 2. Store Operation (Assign 99 to index 0)
+        assert!(smt.contains("(declare-const arr_1 (Array Int Int))"));
+        assert!(smt.contains("(= arr_1 (store arr_0 0 99))"));
+
+        // 3. Post-conditions (Select)
+        // Checks arr_1[0] == 99
+        assert!(smt.contains("(select arr_1 0)"));
+        // Checks arr_1[1] == arr_0[1]
+        assert!(smt.contains("(select arr_1 1)"));
+        assert!(smt.contains("(select arr_0 1)"));
     }
 }

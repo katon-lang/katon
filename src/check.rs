@@ -1,5 +1,5 @@
 // Implementation of affine types
-use crate::ast::{Expr, FnDecl, Stmt, Type};
+use crate::ast::{Expr, FnDecl, Op, Stmt, Type};
 use std::collections::HashMap;
 
 pub struct BorrowChecker {
@@ -37,7 +37,7 @@ impl BorrowChecker {
     fn is_copy(&self, ty: &Type) -> bool {
         match ty {
             Type::Int | Type::Nat => true, // Primitives copy
-                                           // Type::Ptr(_) => false,
+            Type::Array(_) => false,       // Array moves
         }
     }
 
@@ -56,7 +56,7 @@ impl BorrowChecker {
                 } else {
                     // It's a new definition (e.g. x := 5)
                     // For now, default to Int if unknown, or error.
-                    // Ideally, your AST needs type inference here.
+                    // Ideally, Katon AST needs type inference here.
                     self.scope.insert(target.clone(), (true, Type::Int));
                 }
                 Ok(())
@@ -126,6 +126,37 @@ impl BorrowChecker {
 
                 Ok(())
             }
+            Stmt::ArrayUpdate {
+                target,
+                index,
+                value,
+            } => {
+                //  Check the Index expression (Read)
+                self.check_expr(index)?;
+
+                // 2. Check the Value expression (Read/Move)
+                self.check_expr(value)?;
+
+                // 3. Verify the Array itself is Valid
+                if let Some((is_alive, ty)) = self.scope.get(target) {
+                    // Rule: Katon cannot modify a moved array
+                    if !is_alive {
+                        return Err(format!(
+                            "Borrow Error: Cannot assign to moved or uninitialized array '{}'.",
+                            target
+                        ));
+                    }
+
+                    // Rule: Must actually be an Array type
+                    if !matches!(ty, Type::Array(_)) {
+                        return Err(format!("Type Error: '{}' is not an array.", target));
+                    }
+                } else {
+                    return Err(format!("Borrow Error: Undefined variable '{}'.", target));
+                }
+
+                Ok(())
+            }
         }
     }
 
@@ -147,6 +178,26 @@ impl BorrowChecker {
                 }
             }
             Expr::Cast(_, inner) => self.check_expr(inner),
+            Expr::Binary(lhs, Op::Index, rhs) => {
+                // 1. Check the Index (rhs)
+                self.check_expr(rhs)?;
+
+                // 2. Check the Array (lhs) carefully
+                // If lhs is a variable, we peek at it without killing it
+                if let Expr::Var(name) = &**lhs
+                    && let Some((is_alive, _)) = self.scope.get(name)
+                {
+                    if !is_alive {
+                        return Err(format!("Borrow Error: Use of moved value: {}", name));
+                    }
+
+                    // DO NOT insert(false) here. Indexing borrows, it doesn't consume.
+                    return Ok(());
+                }
+
+                // If lhs is complex (e.g. arr_factory()[0]), process recursively
+                self.check_expr(lhs)
+            }
             Expr::Binary(l, _, r) => {
                 // Order matters! Left is evaluated/moved first.
                 self.check_expr(l)?;

@@ -125,7 +125,7 @@ mod tests {
         assert_eq!(parser.parse("(123)").unwrap(), Expr::IntLit(123));
 
         // Negative numbers (unary minus)
-        // "-5" parses as "0 - 5" based on your grammar rule: "-" <f:Factor> => 0 - f
+        // "-5" parses as "0 - 5" based on the grammar rule: "-" <f:Factor> => 0 - f
         assert_eq!(parser.parse("-5").unwrap(), bin(int(0), Op::Sub, int(5)));
 
         assert_eq!(

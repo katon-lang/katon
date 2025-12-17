@@ -10,6 +10,7 @@ grammar;
 pub Type: Type = {
     "int" => Type::Int,
     "nat" => Type::Nat,
+    "[" "]" <t:Type> => Type::Array(Box::new(t)),
 };
 
 // ===========================================
@@ -34,17 +35,26 @@ pub Term: Expr = {
 };
 
 pub Product: Expr = {
-    <l:Product> "*" <r:Factor> => Expr::Binary(Box::new(l), Op::Mul, Box::new(r)),
-    <l:Product> "/" <r:Factor> => Expr::Binary(Box::new(l), Op::Div, Box::new(r)),
-    Factor,
+    <l:Product> "*" <r:Unary> => Expr::Binary(Box::new(l), Op::Mul, Box::new(r)),
+    <l:Product> "/" <r:Unary> => Expr::Binary(Box::new(l), Op::Div, Box::new(r)),
+    Unary,
 };
+
+pub Unary: Expr = {
+    "-" <u:Unary> => Expr::Binary(Box::new(Expr::IntLit(0)), Op::Sub, Box::new(u)),
+    Factor,
+}
 
 // Tier 3: Highest precedence (Atoms)
 pub Factor: Expr = {
+    <base:Factor> "[" <idx:Expr> "]" => Expr::Binary(Box::new(base), Op::Index, Box::new(idx)),
+    Atom,
+};
+
+pub Atom: Expr = {
     <i:Int> => Expr::IntLit(i),
     <id:Ident> => Expr::Var(id),
     <t:Type> "(" <e:Expr> ")" => Expr::Cast(t, Box::new(e)),
-    "-" <f:Factor> => Expr::Binary(Box::new(Expr::IntLit(0)), Op::Sub, Box::new(f)),
     "old" "(" <id:Ident> ")" => Expr::Old(id),
     "(" <e:Expr> ")" => e,
 };
@@ -56,6 +66,13 @@ pub Factor: Expr = {
 pub Stmt: Stmt = {
     // Assignment: x = 5
     <id:Ident> "=" <e:Expr> => Stmt::Assign { target: id, value: e },
+
+    // Array Update: id "[" expr "]" = expr
+    <id:Ident> "[" <idx:Expr> "]" "=" <val:Expr> => Stmt::ArrayUpdate { 
+        target: id, 
+        index: idx, 
+        value: val 
+    },
 
     // If Statement
     "if" <cond:Expr> <then_block:Block> <else_block:("else" <Block>)?> => {
