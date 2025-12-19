@@ -120,11 +120,19 @@ Block: Vec<Spanned<Stmt>> = {
 // ===========================================
 
 // Requires and Ensures now expect Spanned<Expr> because 'Expr' rule returns it
-Requires: Spanned<Expr> = "requires" <e:Expr> => e;
-Ensures: Spanned<Expr> = "ensures" <e:Expr> => e;
+Requires: Spanned<Expr> = {
+    <l:@L> "requires" <e:Expr> ";" <r:@R> =>
+        Spanned::new(e.node, Span::new(l, r))
+};
+
+Ensures: Spanned<Expr> = {
+    <l:@L> "ensures" <e:Expr> ";" <r:@R> =>
+        Spanned::new(e.node, Span::new(l, r))
+};
+
 
 Param: (String, Type) = {
-    <id:Ident> <t:Type> => (id, t)
+    <id:Ident> ":" <t:Type> => (id, t)
 };
 
 Params: Vec<(String, Type)> = {
@@ -138,20 +146,23 @@ Params: Vec<(String, Type)> = {
 };
 
 pub FnDecl: FnDecl = {
-    "func" <name:Ident> "(" <params:Params> ")" "{" 
-        <req:Requires*>   // Vec<Spanned<Expr>>
-        <body:Stmt*>      // Vec<Spanned<Stmt>> (Fixed!)
-        <ens:Ensures*>    // Vec<Spanned<Expr>>
+    "func" <name:Ident> "(" <ps:Params> ")" "{" 
+        <req:Requires*>
+        <body:Stmt*>
+        <ens:Ensures*>
     "}" => {
-        let mut ids = Vec::new();
-        let mut names = Vec::new();
-        for (name, ty) in params {
-            ids.push((NodeId(0), ty)); // Temporary ID
-            names.push(name);          // Actual Name
+        let mut params = Vec::new();
+        let mut param_names = Vec::new();
+        
+        for (p_name, ty) in ps {
+            params.push((NodeId(0), ty)); 
+            param_names.push(p_name);
         }
+
         FnDecl {
             name,
             params,
+            param_names,
             requires: req,
             ensures: ens,
             body,

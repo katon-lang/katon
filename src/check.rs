@@ -2,7 +2,7 @@
 use crate::{
     ast::{Expr, FnDecl, NodeId, Op, SExpr, SStmt, Stmt, Type},
     errors::{CheckError, Diagnostic},
-    symbol::TyCtx,
+    symbol_table::TyCtx,
 };
 use std::collections::HashMap;
 
@@ -78,7 +78,7 @@ impl BorrowChecker {
             } => {
                 self.check_expr(cond)?;
 
-                let start_scope = self.scope.clone();
+                let outer_scope = self.scope.clone();
 
                 // Then Branch
                 for s in then_block {
@@ -88,7 +88,7 @@ impl BorrowChecker {
                 let then_scope = self.scope.clone();
 
                 // Else Branch
-                self.scope = start_scope.clone();
+                self.scope = outer_scope.clone();
                 for s in else_block {
                     self.check_stmt(s, tcx)?;
                 }
@@ -96,7 +96,13 @@ impl BorrowChecker {
                 let else_scope = self.scope.clone();
 
                 // Merge
-                self.scope = self.merge_scopes(then_scope, else_scope);
+                let merged = self.merge_scopes(then_scope, else_scope);
+
+                self.scope = merged
+                    .into_iter()
+                    .filter(|(id, _)| outer_scope.contains_key(id))
+                    .collect();
+
                 Ok(())
             }
             Stmt::While {
@@ -107,7 +113,6 @@ impl BorrowChecker {
                 self.check_expr(cond)?;
                 self.check_expr(invariant)?;
 
-                // Snapshot scope before loop
                 let start_scope = self.scope.clone();
 
                 // Check body
@@ -116,16 +121,17 @@ impl BorrowChecker {
                 }
 
                 // Verify Loop Safety (No moves of outer variables)
-                // We check: Did any variable that was alive at start become dead?
                 for (name_id, (was_alive, _)) in &start_scope {
                     if *was_alive {
+                        // Variables that existed before the loop MUST still be alive
+                        // (We don't allow moving outer variables inside a loop in Katon)
                         let (is_alive_after, _) = self.scope.get(name_id).unwrap();
                         if !is_alive_after {
                             let var_name = tcx
                                 .resolutions
                                 .get(name_id)
                                 .map(|def| def.name.clone())
-                                .unwrap_or_else(|| format!("var_{}", name_id.0)); // Fallback
+                                .unwrap_or_else(|| format!("var_{}", name_id.0));
 
                             return Err(Diagnostic {
                                 error: CheckError::UseAfterMove { var: var_name },
@@ -135,9 +141,8 @@ impl BorrowChecker {
                     }
                 }
 
-                // Reset Scope
-                // After the loop, the state is effectively the same as start
-                // (because we forbade moves), but variables defined INSIDE the loop die.
+                // Reset Scope: Variables defined INSIDE the loop die here.
+                // We revert to start_scope because we already verified no outer moves occurred.
                 self.scope = start_scope;
 
                 Ok(())
@@ -282,12 +287,12 @@ impl BorrowChecker {
         // We iterate over the union of keys, but practically iterating s1 is often enough
         // if we assume new variables declared inside blocks die at end of block.
         // But to be safe, let's look at s1.
-        for (key, (alive1, ty1)) in s1 {
-            if let Some((alive2, _)) = s2.get(&key) {
-                // Alive only if alive in BOTH branches
-                result.insert(key, (alive1 && *alive2, ty1));
+        for (id, (alive1, ty)) in s1 {
+            if let Some((alive2, _)) = s2.get(&id) {
+                // A variable is only alive if it is alive in BOTH paths.
+                // If it was moved in one path, it's moved for the rest of the function.
+                result.insert(id, (alive1 && *alive2, ty));
             }
-            // If missing in s2, it was defined in s1 block -> Drops out of scope (Dead)
         }
 
         result
@@ -303,8 +308,8 @@ mod tests {
 
     use super::*;
 
-    fn var(name: &str) -> SExpr {
-        Spanned::dummy(Expr::Var(name.to_string(), Some(NodeId(0))))
+    fn var(name: &str, id: u32) -> SExpr {
+        Spanned::dummy(Expr::Var(name.to_string(), Some(NodeId(id))))
     }
 
     fn int(n: i64) -> SExpr {
@@ -352,14 +357,14 @@ mod tests {
                     then_block: vec![Spanned::dummy(Stmt::Assign {
                         target: "y".to_string(),
                         target_id: Some(NodeId(1)),
-                        value: var("x"),
+                        value: var("x", 0),
                     })],
                     else_block: vec![],
                 }),
                 Spanned::dummy(Stmt::Assign {
                     target: "z".to_string(),
                     target_id: Some(NodeId(2)),
-                    value: var("x"),
+                    value: var("x", 0),
                 }),
             ],
         };
@@ -399,13 +404,13 @@ mod tests {
                 Spanned::dummy(Stmt::Assign {
                     target: "z".to_string(),
                     target_id: Some(NodeId(1)),
-                    value: bin(var("x"), Op::Add, var("x")),
+                    value: bin(var("x", 0), Op::Add, var("x", 0)),
                 }),
                 // 2. Test Nat Copy: w = y * y
                 Spanned::dummy(Stmt::Assign {
                     target: "w".to_string(),
                     target_id: Some(NodeId(2)),
-                    value: bin(var("y"), Op::Mul, var("y")),
+                    value: bin(var("y", 1), Op::Mul, var("y", 1)),
                 }),
             ],
         };
@@ -433,6 +438,8 @@ mod tests {
 
         let x_id = NodeId(0);
         tcx.define_local(x_id, "x", Type::Int);
+        let y_id = NodeId(1);
+        tcx.define_local(y_id, "y", Type::Int);
 
         let func = FnDecl {
             name: "scope_leak".to_string(),
@@ -442,7 +449,7 @@ mod tests {
             ensures: vec![],
             body: vec![
                 Spanned::dummy(Stmt::If {
-                    cond: bin(var("x"), Op::Gt, int(0)),
+                    cond: bin(var("x", 0), Op::Gt, int(0)),
                     then_block: vec![Spanned::dummy(Stmt::Assign {
                         target: "y".to_string(),
                         target_id: Some(NodeId(1)),
@@ -454,7 +461,7 @@ mod tests {
                 Spanned::dummy(Stmt::Assign {
                     target: "z".to_string(),
                     target_id: Some(NodeId(2)),
-                    value: var("y"),
+                    value: var("y", 1),
                 }),
             ],
         };
@@ -495,11 +502,6 @@ mod tests {
         tcx.define_local(y_id, "y", Type::Int);
         tcx.define_local(z_id, "z", Type::Int);
 
-        let tcx = TyCtx {
-            resolutions: HashMap::new(),
-            node_types: HashMap::new(),
-        };
-
         let func = FnDecl {
             name: "merge_valid".to_string(),
             param_names: vec!["cond".to_string()],
@@ -507,8 +509,13 @@ mod tests {
             requires: vec![],
             ensures: vec![],
             body: vec![
+                Spanned::dummy(Stmt::Assign {
+                    target: "y".to_string(),
+                    target_id: Some(y_id),
+                    value: int(0),
+                }),
                 Spanned::dummy(Stmt::If {
-                    cond: bin(var("cond"), Op::Gt, int(0)),
+                    cond: bin(var("cond", 0), Op::Gt, int(0)),
                     then_block: vec![Spanned::dummy(Stmt::Assign {
                         target: "y".to_string(),
                         target_id: Some(y_id),
@@ -524,7 +531,7 @@ mod tests {
                 Spanned::dummy(Stmt::Assign {
                     target: "z".to_string(),
                     target_id: Some(z_id),
-                    value: var("y"),
+                    value: var("y", 1),
                 }),
             ],
         };
@@ -554,7 +561,7 @@ mod tests {
             body: vec![Spanned::dummy(Stmt::Assign {
                 target: "z".to_string(),
                 target_id: Some(NodeId(1)),
-                value: var("unknown_var"),
+                value: var("unknown_var", 0),
             })],
         };
 
@@ -563,5 +570,65 @@ mod tests {
 
         let err_msg = result.unwrap_err().to_string();
         assert!(err_msg.contains("Variable 'unknown_var' undefined"));
+    }
+
+    #[test]
+    fn test_move_in_one_branch() {
+        // SCENARIO:
+        // func test(arr []int, c int) {
+        //    if c > 0 {
+        //       let b = arr; // arr is MOVED here
+        //    } else {
+        //       // arr is still alive here
+        //    }
+        //
+        //    let z = arr; // ERROR: arr is "maybe moved"
+        // }
+
+        let mut bc = BorrowChecker::new();
+        let mut tcx = TyCtx::new();
+
+        let arr_id = NodeId(0);
+        let c_id = NodeId(1);
+        let arr_type = Type::Array(Box::new(Type::Int));
+
+        tcx.define_local(arr_id, "arr", arr_type.clone());
+        tcx.define_local(c_id, "c", Type::Int);
+
+        let func = FnDecl {
+            name: "test_move".to_string(),
+            param_names: vec!["arr".to_string(), "c".to_string()],
+            params: vec![(arr_id, arr_type), (c_id, Type::Int)],
+            requires: vec![],
+            ensures: vec![],
+            body: vec![
+                Spanned::dummy(Stmt::If {
+                    cond: bin(var("c", 1), Op::Gt, int(0)),
+                    then_block: vec![Spanned::dummy(Stmt::Assign {
+                        target: "b".to_string(),
+                        target_id: Some(NodeId(2)),
+                        value: var("arr", 0), // Move occurs here
+                    })],
+                    else_block: vec![], // arr remains alive here
+                }),
+                // This should fail because 'arr' is not alive in the 'then' path
+                Spanned::dummy(Stmt::Assign {
+                    target: "z".to_string(),
+                    target_id: Some(NodeId(3)),
+                    value: var("arr", 0),
+                }),
+            ],
+        };
+
+        let result = bc.check_fn(&func, &tcx);
+        assert!(result.is_err());
+
+        let err = result.unwrap_err();
+        assert_eq!(
+            err.error,
+            CheckError::UseAfterMove {
+                var: "arr".to_string()
+            }
+        );
     }
 }

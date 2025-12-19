@@ -14,12 +14,23 @@ pub struct TyCtx {
     pub node_types: HashMap<NodeId, Type>,
 }
 
+impl Default for TyCtx {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TyCtx {
     pub fn new() -> Self {
         Self {
             resolutions: HashMap::new(),
             node_types: HashMap::new(),
         }
+    }
+
+    /// Get the type for a specific NodeId
+    pub fn get_type(&self, id: &NodeId) -> Option<&Type> {
+        self.node_types.get(id)
     }
 
     /// Helper for tests to register a variable type manually
@@ -60,6 +71,12 @@ pub enum DefKind {
 pub struct Resolver {
     scopes: Vec<HashMap<String, NodeId>>, // A stack of scopes: name -> unique ID
     next_id: u32,
+}
+
+impl Default for Resolver {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Resolver {

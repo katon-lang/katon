@@ -1,57 +1,55 @@
 use crate::{
     ast::{Expr, FnDecl, NodeId, Op, SExpr, SStmt, Stmt, Type},
-    symbol::TyCtx,
+    symbol_table::TyCtx,
 };
-use std::collections::{HashMap, HashSet};
+use std::{
+    cell::RefCell,
+    collections::{HashMap, HashSet},
+    rc::Rc,
+};
 
+// We make the variable SSA immutable by default
+#[derive(Clone)]
 struct Env {
-    global_gen: HashMap<NodeId, usize>,
-    current_scope: HashMap<NodeId, usize>,
+    versions: HashMap<NodeId, usize>, // current SSA version
+    gens: Rc<RefCell<HashMap<NodeId, usize>>>,
     var_types: HashMap<NodeId, Type>,
 }
 
 impl Env {
     fn new() -> Self {
         Self {
-            global_gen: HashMap::new(),
-            current_scope: HashMap::new(),
+            versions: HashMap::new(),
+            gens: Rc::new(RefCell::new(HashMap::new())),
             var_types: HashMap::new(),
         }
     }
 
-    fn get_smt_name(&self, id: &NodeId, tcx: &TyCtx) -> String {
-        let ver = self.current_scope.get(id).unwrap_or(&0);
-        let name = tcx.get_name(id);
-        format!("{}_{}", name, ver)
+    fn name(&self, id: NodeId, tcx: &TyCtx) -> String {
+        let v = self.versions.get(&id).copied().unwrap_or(0);
+        format!("{}_{}", tcx.get_name(&id), v)
+    }
+
+    fn old(&self, id: NodeId, tcx: &TyCtx) -> String {
+        format!("{}_0", tcx.get_name(&id))
+    }
+
+    /// Create a fresh SSA version (immutable)
+    fn assign(&self, id: NodeId) -> (Self, usize) {
+        let mut next_env = self.clone();
+
+        let mut gens = self.gens.borrow_mut();
+        let v = gens.entry(id).or_insert(0);
+        *v += 1;
+
+        let new_ver = *v;
+        next_env.versions.insert(id, new_ver);
+
+        (next_env, new_ver)
     }
 
     fn register_var(&mut self, id: NodeId, ty: Type) {
         self.var_types.insert(id, ty);
-    }
-
-    // Check if variable is Nat using ID
-    fn is_nat(&self, id: &NodeId) -> bool {
-        matches!(self.var_types.get(id), Some(Type::Nat))
-    }
-
-    // For old(x), we always want the 0th version
-    fn get_old(&self, id: &NodeId, tcx: &TyCtx) -> String {
-        let name = tcx.get_name(id);
-        format!("{}_0", name)
-    }
-
-    // Create a new SSA version (e.g., for x = ...)
-    fn new_version(&mut self, id: NodeId, tcx: &TyCtx) -> String {
-        // Increment global generation
-        let next_ver = self.global_gen.entry(id).or_insert(0);
-        *next_ver += 1;
-        let ver = *next_ver;
-
-        // Update current scope to point to this new version
-        self.current_scope.insert(id, ver);
-
-        let name = tcx.get_name(&id);
-        format!("{}_{}", name, ver)
     }
 }
 
@@ -59,14 +57,8 @@ fn expr_to_smt(expr: &SExpr, env: &Env, tcx: &TyCtx) -> String {
     match &expr.node {
         Expr::IntLit(n) => n.to_string(),
         Expr::BoolLit(b) => b.to_string(),
-        Expr::Var(_name, node_id) => {
-            let id = node_id.expect("VC Gen requires resolved IDs");
-            env.get_smt_name(&id, tcx)
-        }
-        Expr::Old(_name, node_id) => {
-            let id = node_id.expect("VC Gen requires resolved IDs for old()");
-            env.get_old(&id, tcx)
-        }
+        Expr::Var(_name, Some(id)) => env.name(*id, tcx),
+        Expr::Old(_name, Some(id)) => env.old(*id, tcx),
         Expr::Cast(_, inner) => expr_to_smt(inner, env, tcx), // The safety check happens at the assignment level
         Expr::Binary(lhs, op, rhs) => {
             let l = expr_to_smt(lhs, env, tcx);
@@ -86,6 +78,7 @@ fn expr_to_smt(expr: &SExpr, env: &Env, tcx: &TyCtx) -> String {
             };
             format!("({} {} {})", op_str, l, r)
         }
+        _ => unimplemented!(),
     }
 }
 
@@ -126,82 +119,71 @@ fn type_to_smt(ty: &Type) -> String {
     }
 }
 
-fn process_block(stmts: &[SStmt], env: &mut Env, smt: &mut String, tcx: &TyCtx) {
+fn process_block(stmts: &[SStmt], env: Env, smt: &mut String, tcx: &TyCtx) -> Env {
+    let mut env = env;
+
     for stmt in stmts {
         match &stmt.node {
             Stmt::Assign {
-                target,
-                target_id,
-                value,
+                target_id, value, ..
             } => {
-                let val_smt = expr_to_smt(value, env, tcx);
-                let id = target_id.expect("VC Gen: Missing ID for assignment");
+                let id = target_id.unwrap();
+                let val = expr_to_smt(value, &env, tcx);
 
-                // If target is Nat, we MUST prove value >= 0 before proceeding
-                if env.is_nat(&id) {
-                    smt.push_str(&format!("; SAFETY CHECK: {} must be Nat\n", target));
-                    smt.push_str("(push)\n");
-                    // We assert the negation: "Is it possible for val to be < 0?"
-                    smt.push_str(&format!("(assert (< {} 0))\n", val_smt));
-                    smt.push_str("(check-sat)\n");
-                    // If SAT -> Verification Error: "Assignment violates nat type"
-                    smt.push_str("(pop)\n");
-                }
+                let (env2, ver) = env.assign(id);
+                let name = format!("{}_{}", tcx.get_name(&id), ver);
+                let ty = type_to_smt(env.var_types.get(&id).unwrap());
 
-                let new_target_name = env.new_version(id, tcx);
-                let ty_smt = type_to_smt(env.var_types.get(&id).unwrap_or(&Type::Int));
+                smt.push_str(&format!("(declare-const {} {})\n", name, ty));
+                smt.push_str(&format!("(assert (= {} {}))\n", name, val));
 
-                smt.push_str(&format!("(declare-const {} {})\n", new_target_name, ty_smt));
-                smt.push_str(&format!("(assert (= {} {}))\n", new_target_name, val_smt));
-
-                // Add the type constraint to the main path too, so future logic knows it's positive
-                if env.is_nat(&id) {
-                    smt.push_str(&format!("(assert (>= {} 0))\n", new_target_name));
-                }
+                env = env2;
             }
             Stmt::If {
                 cond,
                 then_block,
                 else_block,
             } => {
-                let cond_smt = expr_to_smt(cond, env, tcx);
+                let cond_smt = expr_to_smt(cond, &env, tcx);
 
-                // 1. Save Scope (NOT global counters)
-                let start_scope = env.current_scope.clone();
+                let then_env = process_block(then_block, env.clone(), smt, tcx);
+                let else_env = process_block(else_block, env.clone(), smt, tcx);
 
-                // 2. Process THEN
-                process_block(then_block, env, smt, tcx);
-                let then_scope = env.current_scope.clone();
+                let mut merged_env = env.clone();
+                let vars: HashSet<NodeId> = then_env
+                    .versions
+                    .keys()
+                    .chain(else_env.versions.keys())
+                    .cloned()
+                    .collect();
 
-                // 3. Restore Scope & Process ELSE
-                env.current_scope = start_scope.clone(); // Reset local scope
-                process_block(else_block, env, smt, tcx);
-                let else_scope = env.current_scope.clone();
+                for id in vars {
+                    let v_orig = env.versions.get(&id).copied().unwrap_or(0);
+                    let v_then = then_env.versions.get(&id).copied().unwrap_or(v_orig);
+                    let v_else = else_env.versions.get(&id).copied().unwrap_or(v_orig);
 
-                // Merging logic using Node IDs
-                let mut all_vars: HashSet<NodeId> = start_scope.keys().cloned().collect();
-                all_vars.extend(then_scope.keys());
-                all_vars.extend(else_scope.keys());
+                    if v_then != v_orig || v_else != v_orig {
+                        // Get a truly unique new version for the merged result
+                        let (next, v_phi) = merged_env.assign(id);
+                        merged_env = next;
 
-                for var_id in all_vars {
-                    let v_start = *start_scope.get(&var_id).unwrap_or(&0);
-                    let v_then = *then_scope.get(&var_id).unwrap_or(&v_start);
-                    let v_else = *else_scope.get(&var_id).unwrap_or(&v_start);
+                        let name = format!("{}_{}", tcx.get_name(&id), v_phi);
+                        let ty = type_to_smt(merged_env.var_types.get(&id).unwrap());
 
-                    if v_then != v_start || v_else != v_start {
-                        let merged_name = env.new_version(var_id, tcx);
-                        let ty_smt = type_to_smt(env.var_types.get(&var_id).unwrap_or(&Type::Int));
-
-                        let then_name = format!("{}_{}", tcx.get_name(&var_id), v_then);
-                        let else_name = format!("{}_{}", tcx.get_name(&var_id), v_else);
-
-                        smt.push_str(&format!("(declare-const {} {})\n", merged_name, ty_smt));
+                        smt.push_str(&format!("(declare-const {} {})\n", name, ty));
                         smt.push_str(&format!(
-                            "(assert (= {} (ite {} {} {})))\n",
-                            merged_name, cond_smt, then_name, else_name
+                            "(assert (= {} (ite {} {}_{} {}_{})))\n",
+                            name,
+                            cond_smt,
+                            tcx.get_name(&id),
+                            v_then,
+                            tcx.get_name(&id),
+                            v_else
                         ));
                     }
                 }
+
+                return merged_env;
             }
             Stmt::While {
                 cond,
@@ -210,145 +192,143 @@ fn process_block(stmts: &[SStmt], env: &mut Env, smt: &mut String, tcx: &TyCtx) 
             } => {
                 // Assert Invariant holds on Entry
                 // Does the invariant hold BEFORE the loop starts?
-                let inv_entry = expr_to_smt(invariant, env, tcx);
-                smt.push_str("; CHECK 1: Loop Entry Invariant\n");
-                smt.push_str("(push)\n");
-                smt.push_str(&format!("(assert (not {}))\n", inv_entry)); // Negate to find bug
-                smt.push_str("(check-sat)\n");
-                smt.push_str("(pop)\n");
+                // 1. Initial Check
+                let inv_init = expr_to_smt(invariant, &env, tcx);
+                smt.push_str("; Check: Invariant on Entry\n(push)\n");
+                smt.push_str(&format!(
+                    "(assert (not {}))\n(check-sat)\n(pop)\n",
+                    inv_init
+                ));
 
-                // We get the NodeIds of anything changed inside the loop
-                // Create a new SSA version for the loop's arbitrary iteration
+                // 2. Havoc
                 let modified = get_modified_vars(body);
-                for var_id in &modified {
-                    let new_ver_name = env.new_version(*var_id, tcx);
-                    let ty_smt = type_to_smt(env.var_types.get(var_id).unwrap_or(&Type::Int));
-
-                    smt.push_str(&format!("(declare-const {} {})\n", new_ver_name, ty_smt));
+                let mut loop_env = env.clone();
+                for id in modified {
+                    let (next, ver) = loop_env.assign(id);
+                    loop_env = next;
+                    let ty = type_to_smt(loop_env.var_types.get(&id).unwrap());
+                    smt.push_str(&format!(
+                        "(declare-const {}_{} {})\n",
+                        tcx.get_name(&id),
+                        ver,
+                        ty
+                    ));
                 }
 
-                // Assume Invariant is True at start of an arbitrary iteration
-                let inv_havoc = expr_to_smt(invariant, env, tcx);
-                smt.push_str(&format!("(assert {})\n", inv_havoc));
+                // 3. Assume Invariant and Maintenance
+                let inv_head = expr_to_smt(invariant, &loop_env, tcx);
+                smt.push_str(&format!("(assert {})\n", inv_head));
 
-                // CHECK: Loop Body Maintenance
-                smt.push_str("; CHECK 2: Loop Body Maintenance\n");
-                smt.push_str("(push)\n");
+                smt.push_str("; Check: Maintenance\n(push)\n");
+                let c_smt = expr_to_smt(cond, &loop_env, tcx);
+                smt.push_str(&format!("(assert {})\n", c_smt));
 
-                // A. Assume Loop Condition is True
-                let cond_havoc = expr_to_smt(cond, env, tcx);
-                smt.push_str(&format!("(assert {})\n", cond_havoc));
-
-                // B. Run Body using a temporary Env clone
-                // This uses new ID-based Env fields
-                let mut body_env = Env {
-                    global_gen: env.global_gen.clone(),
-                    current_scope: env.current_scope.clone(),
-                    var_types: env.var_types.clone(),
-                };
-
-                process_block(body, &mut body_env, smt, tcx);
-
-                // C. Verify Invariant still holds after the body runs
+                let body_env = process_block(body, loop_env.clone(), smt, tcx);
                 let inv_post = expr_to_smt(invariant, &body_env, tcx);
-                smt.push_str(&format!("(assert (not {}))\n", inv_post));
-                smt.push_str("(check-sat)\n");
-                smt.push_str("(pop)\n");
+                smt.push_str(&format!(
+                    "(assert (not {}))\n(check-sat)\n(pop)\n",
+                    inv_post
+                ));
 
-                // 5. Termination: Continue main path assuming Loop Condition is False
-                let cond_exit = expr_to_smt(cond, env, tcx);
-                smt.push_str(&format!("(assert (not {}))\n", cond_exit));
+                // 4. Exit
+                let c_exit = expr_to_smt(cond, &loop_env, tcx);
+                smt.push_str(&format!("(assert (not {}))\n", c_exit));
+
+                env = loop_env;
             }
             Stmt::ArrayUpdate {
-                target,
                 target_id,
                 index,
                 value,
+                ..
             } => {
-                let id = target_id.expect("VC Gen: Missing ID for array update");
+                let id = target_id.expect("Missing ID");
+                let old_name = env.name(id, tcx);
+                let idx_smt = expr_to_smt(index, &env, tcx);
+                let val_smt = expr_to_smt(value, &env, tcx);
 
-                let idx_smt = expr_to_smt(index, env, tcx);
-                let val_smt = expr_to_smt(value, env, tcx);
+                // Bounds Check
+                let len_name = format!("{}_length", tcx.get_name(&id));
+                smt.push_str("; Safety Check: Array Bounds\n(push)\n");
+                smt.push_str(&format!(
+                    "(assert (not (and (>= {0} 0) (< {0} {1}))))\n",
+                    idx_smt, len_name
+                ));
+                smt.push_str("(check-sat)\n(pop)\n");
 
-                let current_arr_name = env.get_smt_name(&id, tcx);
+                let (next_env, ver) = env.assign(id);
+                let new_name = format!("{}_{}", tcx.get_name(&id), ver);
+                let ty_smt = type_to_smt(env.var_types.get(&id).unwrap());
 
-                // Bounds checking
-                // Note: This assumes that the array type/logic supports a 'length' property or function
-                smt.push_str(&format!("; SAFETY CHECK: {} index out of bounds\n", target));
-                smt.push_str("(push)\n");
-                // We try to prove a bug exists: (index < 0) OR (index >= length)
-                // For now, Katon usually assumes arrays are indexed by Nat
-                smt.push_str(&format!("(assert (not (and (>= {0} 0))))\n", idx_smt));
-                smt.push_str("(check-sat)\n");
-                smt.push_str("(pop)\n");
-
-                // Create new array version
-                let new_arr_name = env.new_version(id, tcx);
-                let ty_smt = type_to_smt(env.var_types.get(&id).expect("Array type missing"));
-
-                // Emit SMT Logic
-                // (declare-const a_1 (Array Int Int))
-                smt.push_str(&format!("(declare-const {} {})\n", new_arr_name, ty_smt));
-
-                // (assert (= a_1 (store a_0 index value)))
+                smt.push_str(&format!("(declare-const {} {})\n", new_name, ty_smt));
                 smt.push_str(&format!(
                     "(assert (= {} (store {} {} {})))\n",
-                    new_arr_name, current_arr_name, idx_smt, val_smt
+                    new_name, old_name, idx_smt, val_smt
                 ));
+
+                env = next_env;
             }
         }
     }
+
+    env
 }
 
 pub fn compile(func: &FnDecl, tcx: &TyCtx) -> String {
     let mut smt = String::from("(set-logic QF_AUFNIA)\n");
     let mut env = Env::new();
 
+    // Pass 1: Pre-register all types from Symbol Table
+    let modified = get_modified_vars(&func.body);
+    let all_vars = func.params.iter().map(|(id, _)| *id).chain(modified);
+    for id in all_vars {
+        if let Some(ty) = tcx.get_type(&id) {
+            env.register_var(id, ty.clone());
+        }
+    }
+
+    // Pass 2: Declare Parameters
     for (id, ty) in &func.params {
+        let (next_env, ver) = env.assign(*id);
+        env = next_env;
+
         let name = tcx.get_name(id);
-        env.register_var(*id, ty.clone());
+        let ssa_name = format!("{}_{}", name, ver);
+        smt.push_str(&format!(
+            "(declare-const {} {})\n",
+            ssa_name,
+            type_to_smt(ty)
+        ));
 
-        let ty_smt = type_to_smt(ty);
-
-        smt.push_str(&format!("(declare-const {}_0 {})\n", name, ty_smt));
-
-        // Track the current version of this ID in the environment
-        env.current_scope.insert(*id, 0);
-
-        // Nat constraint: x >= 0
         if let Type::Nat = ty {
-            smt.push_str(&format!("(assert (>= {}_0 0))\n", name));
+            smt.push_str(&format!("(assert (>= {} 0))\n", ssa_name));
+        }
+        if let Type::Array(_) = ty {
+            smt.push_str(&format!(
+                "(declare-const {}_length Int)\n(assert (>= {}_length 0))\n",
+                name, name
+            ));
         }
     }
 
     // Preconditions
-    let requires = if func.requires.is_empty() {
-        "true".to_string()
-    } else {
-        format!(
-            "(and {})",
-            func.requires
-                .iter()
-                .map(|r| expr_to_smt(r, &env, tcx))
-                .collect::<Vec<_>>()
-                .join(" ")
-        )
-    };
-    smt.push_str(&format!("; PRECONDITIONS\n(assert {})\n", requires));
+    let reqs = func
+        .requires
+        .iter()
+        .map(|r| expr_to_smt(r, &env, tcx))
+        .collect::<Vec<_>>();
+    if !reqs.is_empty() {
+        smt.push_str(&format!("(assert (and {}))\n", reqs.join(" ")));
+    }
 
-    // This generates all the assignment logic, if-merges, and loop havocs
-    process_block(&func.body, &mut env, &mut smt, tcx);
+    // Body
+    let final_env = process_block(&func.body, env, &mut smt, tcx);
 
-    // Postconditions (Ensures)
-    // We prove: (Requires && Body) => Ensures
-    // SMT way: (Requires && Body && (not Ensures)) is UNSAT
+    // Postconditions
     for ens in &func.ensures {
-        let post = expr_to_smt(ens, &env, tcx);
-        smt.push_str("\n; CHECK POSTCONDITION\n");
-        smt.push_str("(push)\n");
-        smt.push_str(&format!("(assert (not {}))\n", post));
-        smt.push_str("(check-sat)\n");
-        smt.push_str("(pop)\n");
+        let post = expr_to_smt(ens, &final_env, tcx);
+        smt.push_str("\n; Check Postcondition\n(push)\n");
+        smt.push_str(&format!("(assert (not {}))\n(check-sat)\n(pop)\n", post));
     }
 
     smt
@@ -395,16 +375,18 @@ mod tests {
         let x_id = NodeId(0);
         let y_id = NodeId(1);
 
+        // Register types in the symbol table
         tcx.define_local(x_id, "x", Type::Int);
         tcx.define_local(y_id, "y", Type::Int);
 
         let func = FnDecl {
             name: "abs".to_string(),
-            params: vec![(x_id, Type::Int)], // x_0 declared automatically
+            params: vec![(x_id, Type::Int)],
             param_names: vec!["x".to_string()],
             requires: vec![],
             body: vec![
                 // 1. Init y = x
+                // Current x is x_1. This creates y_1 (or y_2 if y was initialized to 0)
                 Spanned::dummy(Stmt::Assign {
                     target: "y".to_string(),
                     target_id: Some(y_id),
@@ -414,7 +396,7 @@ mod tests {
                 Spanned::dummy(Stmt::If {
                     cond: bin(var("x", 0), Op::Lt, int(0)),
                     then_block: vec![
-                        // y = 0 - x
+                        // y = 0 - x -> creates y_2
                         Spanned::dummy(Stmt::Assign {
                             target: "y".to_string(),
                             target_id: Some(y_id),
@@ -422,7 +404,7 @@ mod tests {
                         }),
                     ],
                     else_block: vec![
-                        // y = x
+                        // y = x -> creates y_3
                         Spanned::dummy(Stmt::Assign {
                             target: "y".to_string(),
                             target_id: Some(y_id),
@@ -432,33 +414,39 @@ mod tests {
                 }),
             ],
             ensures: vec![
-                // y >= 0
+                // y >= 0. This must point to the merged version (y_4)
                 bin(var("y", 1), Op::Gte, int(0)),
             ],
         };
 
         let smt_output = compile(&func, &tcx);
 
-        // 1. Initial State
-        assert!(smt_output.contains("(declare-const x_0 Int)"));
+        // 1. Parameters
+        // compile() calls env.assign(x), so parameter is x_1
+        assert!(smt_output.contains("(declare-const x_1 Int)"));
 
-        // 2. Initial Assignment (y = x) -> y_1
+        // 2. First assignment: y = x
+        // env.assign(y) creates y_1
         assert!(smt_output.contains("(declare-const y_1 Int)"));
-        assert!(smt_output.contains("(= y_1 x_0)"));
+        assert!(smt_output.contains("(= y_1 x_1)"));
 
-        // 3. Branches (y_2 and y_3)
-        // Inside 'then', y gets a new global version
-        assert!(smt_output.contains("(= y_2 (- 0 x_0))"));
-        // Inside 'else', y gets the next global version
-        assert!(smt_output.contains("(= y_3 x_0)"));
+        // 3. Inside branches
+        // "then" block calls env.assign(y) -> y_2
+        assert!(smt_output.contains("(declare-const y_2 Int)"));
+        assert!(smt_output.contains("(= y_2 (- 0 x_1))"));
 
-        // 4. THE MERGE (Phi Node)
-        // merge_scopes detects y was changed and creates y_4
+        // "else" block calls env.assign(y) -> y_3
+        assert!(smt_output.contains("(declare-const y_3 Int)"));
+        assert!(smt_output.contains("(= y_3 x_1)"));
+
+        // 4. THE PHI MERGE
+        // process_block detects y changed in branches and creates a new version y_4
         assert!(smt_output.contains("(declare-const y_4 Int)"));
-        assert!(smt_output.contains("ite (< x_0 0) y_2 y_3"));
+        assert!(smt_output.contains("(assert (= y_4 (ite (< x_1 0) y_2 y_3)))"));
 
-        // 5. Post-condition must check the merged version (y_4)
-        assert!(smt_output.contains("(not (>= y_4 0))"));
+        // 5. POSTCONDITION
+        // The final_env has y at version 4.
+        assert!(smt_output.contains("(assert (not (>= y_4 0)))"));
         assert!(smt_output.contains("(check-sat)"));
     }
 
@@ -557,9 +545,9 @@ mod tests {
         };
 
         let smt = compile(&func, &tcx);
-        assert!(smt.contains("(declare-const arr_0 (Array Int Int))"));
         assert!(smt.contains("(declare-const arr_1 (Array Int Int))"));
-        assert!(smt.contains("(= arr_1 (store arr_0 0 99))"));
-        assert!(smt.contains("(select arr_1 0)"));
+        assert!(smt.contains("(declare-const arr_2 (Array Int Int))"));
+        assert!(smt.contains("(= arr_2 (store arr_1 0 99))"));
+        assert!(smt.contains("(select arr_2 0)"));
     }
 }

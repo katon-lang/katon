@@ -3,7 +3,7 @@ pub mod check;
 pub mod codegen;
 pub mod errors;
 pub mod runner;
-pub mod symbol;
+pub mod symbol_table;
 pub mod vc;
 
 use lalrpop_util::lalrpop_mod;
@@ -35,8 +35,8 @@ fn main() {
     match parse_result {
         Ok(mut func_decl) => {
             println!("> Parsing: ✅");
-            let mut tcx = symbol::TyCtx::new();
-            let mut resolver = symbol::Resolver::new();
+            let mut tcx = symbol_table::TyCtx::new();
+            let mut resolver = symbol_table::Resolver::new();
 
             if let Err(diag) = resolver.resolve_function(&mut func_decl, &mut tcx) {
                 println!("❌ Name Resolution Failed:\n{}", diag);
@@ -84,7 +84,7 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use crate::ast::NodeId;
-    use crate::symbol::TyCtx;
+    use crate::symbol_table::TyCtx;
 
     use super::ast::{Expr, FnDecl, Op, SExpr, Stmt, Type};
     use super::check::BorrowChecker;
@@ -93,12 +93,8 @@ mod tests {
     use super::runner;
     use super::vc;
 
-    fn var(name: &str, id: u32) -> SExpr {
-        Spanned::dummy(Expr::Var(name.to_string(), Some(NodeId(id))))
-    }
-
-    fn old(name: &str, id: u32) -> SExpr {
-        Spanned::dummy(Expr::Old(name.to_string(), Some(NodeId(id))))
+    fn var(name: &str, id: Option<u32>) -> SExpr {
+        Spanned::dummy(Expr::Var(name.to_string(), id.map(NodeId)))
     }
 
     fn int(n: i64) -> SExpr {
@@ -143,7 +139,10 @@ mod tests {
         // Test 2: "x == 1 + 2"
         let mut res = parser.parse("x == 1 + 2").unwrap();
         remove_spans(&mut res); // <--- Normalize the spans
-        assert_eq!(res, bin(var("x", 0), Op::Eq, bin(int(1), Op::Add, int(2))));
+        assert_eq!(
+            res,
+            bin(var("x", None), Op::Eq, bin(int(1), Op::Add, int(2)))
+        );
     }
 
     #[test]
@@ -180,7 +179,7 @@ mod tests {
 
         // Compare only the .node
         let old_res = parser.parse("old(balance)").unwrap();
-        assert_eq!(old_res.node, old("balance", 0).node);
+        assert_eq!(old_res.node, Expr::Old("balance".to_string(), None));
     }
 
     #[test]
@@ -188,13 +187,9 @@ mod tests {
         let parser = katon::StmtParser::new();
 
         // Assignment
-        let assign = parser.parse("x = 100").unwrap();
+        let assign = parser.parse("x = 100;").unwrap();
         match assign.node {
-            Stmt::Assign {
-                target,
-                target_id,
-                value,
-            } => {
+            Stmt::Assign { target, value, .. } => {
                 assert_eq!(target, "x");
                 assert_eq!(value.node, int(100).node);
             }
@@ -202,7 +197,7 @@ mod tests {
         }
 
         // If-Else
-        let if_stmt = parser.parse("if x > 0 { y = 1 } else { y = 2 }").unwrap();
+        let if_stmt = parser.parse("if x > 0 { y = 1; } else { y = 2; }").unwrap();
         match if_stmt.node {
             Stmt::If {
                 cond,
@@ -223,7 +218,7 @@ mod tests {
         }
 
         // If without Else (should have empty else_block)
-        let if_only = parser.parse("if x > 0 { y = 1 }").unwrap();
+        let if_only = parser.parse("if x > 0 { y = 1; }").unwrap();
         match if_only.node {
             Stmt::If { else_block, .. } => {
                 assert!(else_block.is_empty());
@@ -237,7 +232,7 @@ mod tests {
         let parser = katon::FnDeclParser::new();
 
         let code = r#"
-            func transfer(from int, to int, amount int) {
+            func transfer(from: int, to: int, amount: int) {
                 requires amount > 0;
                 requires from > amount;
                 
@@ -278,15 +273,15 @@ mod tests {
             param_names: vec!["x".to_string()],
             params: vec![(x_id, Type::Nat)],
             requires: vec![
-                bin(var("x", 0), Op::Gt, int(10)),
-                bin(var("x", 0), Op::Lt, int(5)),
+                bin(var("x", Some(0)), Op::Gt, int(10)),
+                bin(var("x", Some(0)), Op::Lt, int(5)),
             ],
             body: vec![Spanned::dummy(Stmt::Assign {
                 target: "x".to_string(),
-                target_id: Some(NodeId(1)),
+                target_id: Some(x_id),
                 value: int(99999),
             })],
-            ensures: vec![bin(var("x", 0), Op::Eq, int(0))],
+            ensures: vec![bin(var("x", Some(0)), Op::Eq, int(0))],
         };
 
         // This must PASS Z3
@@ -302,12 +297,12 @@ mod tests {
     fn test_uninitialized_merge_scope() {
         // func BrokenScope(c int) {
         //     if c > 0 {
-        //         y = 50
+        //         let y = 50
         //     } else {
         //         // y NOT defined
         //     }
         //
-        //     z = y + 1 <-- ERROR: y is undefined
+        //     let z = y + 1 <-- ERROR: y is undefined
         // }
 
         let mut tcx = TyCtx::new();
@@ -323,7 +318,7 @@ mod tests {
             ensures: vec![],
             body: vec![
                 Spanned::dummy(Stmt::If {
-                    cond: bin(var("c", 0), Op::Gt, int(0)),
+                    cond: bin(var("c", Some(0)), Op::Gt, int(0)),
                     then_block: vec![Spanned::dummy(Stmt::Assign {
                         target: "y".to_string(),
                         target_id: Some(NodeId(1)),
@@ -336,7 +331,7 @@ mod tests {
                 Spanned::dummy(Stmt::Assign {
                     target: "z".to_string(),
                     target_id: Some(NodeId(2)),
-                    value: bin(var("y", 0), Op::Add, int(1)),
+                    value: bin(var("y", Some(1)), Op::Add, int(1)),
                 }),
             ],
         };
@@ -386,22 +381,22 @@ mod tests {
                     cond: bool_lit(true),
                     then_block: vec![Spanned::dummy(Stmt::Assign {
                         target: "x".to_string(),
-                        target_id: Some(NodeId(0)),
+                        target_id: Some(x_id),
                         value: int(1),
                     })],
                     else_block: vec![Spanned::dummy(Stmt::Assign {
                         target: "x".to_string(),
-                        target_id: Some(NodeId(1)),
+                        target_id: Some(x_id),
                         value: int(2),
                     })],
                 })],
                 else_block: vec![Spanned::dummy(Stmt::Assign {
                     target: "x".to_string(),
-                    target_id: Some(NodeId(2)),
+                    target_id: Some(x_id),
                     value: int(3),
                 })],
             })],
-            ensures: vec![bin(var("x", 0), Op::Eq, int(1))],
+            ensures: vec![bin(var("x", Some(0)), Op::Eq, int(1))],
         };
 
         let smt = vc::compile(&func, &tcx);
@@ -423,26 +418,31 @@ mod tests {
         let mut tcx = TyCtx::new();
 
         let x_id = NodeId(0);
+        let y_id = NodeId(1);
+        let z_id = NodeId(2);
+
         tcx.define_local(x_id, "x", Type::Int);
+        tcx.define_local(y_id, "y", Type::Int);
+        tcx.define_local(z_id, "z", Type::Int);
 
         let func = FnDecl {
             name: "Math".to_string(),
             param_names: vec!["x".to_string()],
             params: vec![(x_id, Type::Int)],
-            requires: vec![bin(var("x", 0), Op::Gt, int(0))],
+            requires: vec![bin(var("x", Some(0)), Op::Gt, int(0))],
             body: vec![
                 Spanned::dummy(Stmt::Assign {
                     target: "y".to_string(),
-                    target_id: Some(NodeId(1)),
-                    value: bin(var("x", 0), Op::Mul, var("x", 0)),
+                    target_id: Some(y_id),
+                    value: bin(var("x", Some(0)), Op::Mul, var("x", Some(0))),
                 }),
                 Spanned::dummy(Stmt::Assign {
                     target: "z".to_string(),
-                    target_id: Some(NodeId(2)),
-                    value: bin(var("y", 0), Op::Div, var("x", 0)),
+                    target_id: Some(z_id),
+                    value: bin(var("y", Some(0)), Op::Div, var("x", Some(0))),
                 }),
             ],
-            ensures: vec![bin(var("z", 0), Op::Eq, var("x", 0))],
+            ensures: vec![bin(var("z", Some(0)), Op::Eq, var("x", Some(0)))],
         };
 
         let smt = vc::compile(&func, &tcx);
@@ -474,16 +474,16 @@ mod tests {
             body: vec![
                 Spanned::dummy(Stmt::Assign {
                     target: "x".to_string(),
-                    target_id: Some(NodeId(1)),
+                    target_id: Some(x_id),
                     value: int(0),
                 }),
                 Spanned::dummy(Stmt::While {
-                    cond: bin(var("x", 0), Op::Lt, int(100)),
-                    invariant: bin(var("x", 0), Op::Gt, int(10)), // 0 > 10 is False
+                    cond: bin(var("x", Some(0)), Op::Lt, int(100)),
+                    invariant: bin(var("x", Some(0)), Op::Gt, int(10)), // 0 > 10 is False
                     body: vec![Spanned::dummy(Stmt::Assign {
                         target: "x".to_string(),
-                        target_id: Some(NodeId(2)),
-                        value: bin(var("x", 0), Op::Add, int(1)),
+                        target_id: Some(x_id),
+                        value: bin(var("x", Some(0)), Op::Add, int(1)),
                     })],
                 }),
             ],
