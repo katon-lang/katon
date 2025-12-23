@@ -243,8 +243,8 @@ impl<'a> TypeChecker<'a> {
 
     fn type_error(&self, msg: &str, span: Span) -> Diagnostic {
         Diagnostic {
-            // Use the generic string variant for simple messages
-            error: CheckError::GenericError(msg.to_string()),
+            // Use the internal string variant for simple messages
+            error: CheckError::InternalError(msg.to_string()),
             span,
         }
     }
