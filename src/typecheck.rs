@@ -243,9 +243,122 @@ impl<'a> TypeChecker<'a> {
 
     fn type_error(&self, msg: &str, span: Span) -> Diagnostic {
         Diagnostic {
-            // Use the internal string variant for simple messages
-            error: CheckError::InternalError(msg.to_string()),
+            error: CheckError::TypeError {
+                msg: msg.to_string(),
+            },
             span,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ast::*;
+
+    fn checker() -> TypeChecker<'static> {
+        let tcx = Box::leak(Box::new(TyCtx::default()));
+        TypeChecker::new(tcx)
+    }
+
+    #[test]
+    fn test_let_binding_typechecks() {
+        let mut tc = checker();
+
+        let stmt = SStmt {
+            node: Stmt::Let {
+                id: Some(NodeId(1)),
+                name: "let".to_string(),
+                value: SExpr {
+                    node: Expr::IntLit(42),
+                    span: Span::dummy(),
+                },
+            },
+            span: Span::dummy(),
+        };
+
+        assert!(tc.check_stmt(&stmt).is_ok());
+    }
+
+    #[test]
+    fn test_assignment_type_mismatch_fails() {
+        let mut tc = checker();
+        tc.tcx.node_types.insert(NodeId(1), Type::Int);
+
+        let stmt = SStmt {
+            node: Stmt::Assign {
+                target: "=".to_string(),
+                target_id: Some(NodeId(1)),
+                value: SExpr {
+                    node: Expr::BoolLit(true),
+                    span: Span::dummy(),
+                },
+            },
+            span: Span::dummy(),
+        };
+
+        let err = tc.check_stmt(&stmt).unwrap_err();
+        assert!(matches!(err.error, CheckError::TypeMismatch { .. }));
+    }
+
+    #[test]
+    fn test_if_requires_same_type_in_both_branches() {
+        let mut tc = checker();
+
+        let stmt = SStmt {
+            node: Stmt::If {
+                cond: SExpr {
+                    node: Expr::BoolLit(true),
+                    span: Span::dummy(),
+                },
+                then_block: vec![SStmt {
+                    node: Stmt::Let {
+                        id: Some(NodeId(1)),
+                        name: "if".to_string(),
+                        value: SExpr {
+                            node: Expr::IntLit(1),
+                            span: Span::dummy(),
+                        },
+                    },
+                    span: Span::dummy(),
+                }],
+                else_block: vec![SStmt {
+                    node: Stmt::Let {
+                        id: Some(NodeId(1)),
+                        name: "else".to_string(),
+                        value: SExpr {
+                            node: Expr::BoolLit(false),
+                            span: Span::dummy(),
+                        },
+                    },
+                    span: Span::dummy(),
+                }],
+            },
+            span: Span::dummy(),
+        };
+
+        assert!(tc.check_stmt(&stmt).is_err());
+    }
+
+    #[test]
+    fn while_invariant_must_be_bool() {
+        let mut tc = checker();
+
+        let stmt = SStmt {
+            node: Stmt::While {
+                cond: SExpr {
+                    node: Expr::BoolLit(true),
+                    span: Span::dummy(),
+                },
+                invariant: SExpr {
+                    node: Expr::IntLit(1),
+                    span: Span::dummy(),
+                },
+                body: vec![],
+            },
+            span: Span::dummy(),
+        };
+
+        assert!(tc.check_stmt(&stmt).is_err());
     }
 }
