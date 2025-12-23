@@ -1,6 +1,5 @@
 pub mod ast;
 pub mod check;
-pub mod codegen;
 pub mod errors;
 pub mod runner;
 pub mod symbol_table;
