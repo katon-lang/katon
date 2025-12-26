@@ -5,17 +5,12 @@ use crate::vc::compile;
 use z3::*;
 
 pub fn verify_with_z3(func: &FnDecl, tcx: &TyCtx) -> Result<(), CheckError> {
-    let solver = Solver::new();
-    let mut cfg = Config::new();
-    cfg.set_timeout_msec(10000); // 10 seconds
-
     let vcs = compile(func, tcx);
 
     for (i, vc_text) in vcs.iter().enumerate() {
         // Debug:
         // println!("--- VC {} ---\n{}", i, vc_text);
-
-        solver.push(); // Use solver stack or reset for clean state
+        let solver = Solver::new();
         solver.from_string(vc_text.as_str());
 
         match solver.check() {
