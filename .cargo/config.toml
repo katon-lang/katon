@@ -1,3 +1,0 @@
-[env]
-Z3_SYS_Z3_HEADER = "/opt/z3/include/z3.h"
-Z3_LIBRARY_PATH_OVERRIDE = "/opt/z3/bin"
