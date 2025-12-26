@@ -52,6 +52,9 @@ jobs:
           curl -L https://github.com/Z3Prover/z3/releases/download/z3-4.12.2/z3-4.12.2-x64-win.zip -o z3.zip
           unzip z3.zip
           mv z3-4.12.2-x64-win /c/z3_install
+          echo "C:/z3_install/bin" >> $GITHUB_PATH
+          echo "Z3_SYS_Z3_HEADER=C:/z3_install/include/z3.h" >> $GITHUB_ENV
+          echo "Z3_LIBRARY_PATH_OVERRIDE=C:/z3_install/bin" >> $GITHUB_ENV
 
       - name: Check formatting
         run: cargo fmt -- --check
@@ -64,10 +67,6 @@ jobs:
           elif [[ "${{ matrix.os }}" == "macos-latest" ]]; then
             export Z3_SYS_Z3_HEADER=$(brew --prefix z3)/include/z3.h
             export Z3_LIBRARY_PATH_OVERRIDE=$(brew --prefix z3)/lib
-          elif [[ "${{ matrix.os }}" == "windows-latest" ]]; then
-            export Z3_SYS_Z3_HEADER="C:/z3_install/include/z3.h"
-            export Z3_LIBRARY_PATH_OVERRIDE="C:/z3_install/bin"
-            echo "C:/z3_install/bin" >> $GITHUB_PATH
           fi
 
           cargo clippy -- -D warnings
