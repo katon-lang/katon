@@ -12,7 +12,7 @@ pub Type: Type = {
     "int" => Type::Int,
     "nat" => Type::Nat,
     "bool" => Type::Bool,
-    "[" <t:Type> "]" => Type::Array(Box::new(t)),
+    "[" <n:Int> ";" <t:Type> "]" => Type::Array(n as usize, Box::new(t)),
 };
 
 // ===========================================
@@ -122,14 +122,24 @@ StmtKind: Stmt = {
     // 1. let x = 5; (Inferred/Immediate)
     "let" <id:Ident> "=" <e:Expr> => Stmt::Let {
         name: id,
+        ty: None,
         value: Some(e),
         id: None,
     },
 
+
     // 2. let x: int; (Declaration only)
     "let" <id:Ident> ":" <t:Type> => Stmt::Let {
         name: id,
+        ty: Some(t),
         value: None,
+        id: None,
+    },
+
+    "let" <id:Ident> ":" <t:Type> "=" <e:Expr> => Stmt::Let {
+        name: id,
+        ty: Some(t),
+        value: Some(e),
         id: None,
     },
 
@@ -156,10 +166,21 @@ ControlFlow: Stmt = {
             else_block: else_block.unwrap_or(vec![]),
         }
     },
-    "while" <cond:Expr> "invariant" <inv:Expr> <body:Block> => {
+    "while" <cond:Expr> <invs:("invariant" <Expr>)*> <body:Block> => {
+        // We transform the list of invariants into a single boolean AND expression
+        // so we don't have to change our AST structure.
+        let combined_invariant = invs.into_iter().reduce(|acc, e| {
+            let l = e.span.start;
+            let r = e.span.end;
+            Spanned::new(
+                Expr::Binary(Box::new(acc), Op::And, Box::new(e)),
+                Span::new(l, r)
+            )
+        }).expect("At least one invariant is required by the verifier");
+
         Stmt::While {
             cond,
-            invariant: inv,
+            invariant: combined_invariant,
             body,
         }
     },
@@ -177,8 +198,7 @@ Block: Vec<Spanned<Stmt>> = {
 
 // Requires and Ensures now expect Spanned<Expr> because 'Expr' rule returns it
 Requires: Spanned<Expr> = {
-    <l:@L> "requires" <e:Expr> ";" <r:@R> =>
-        Spanned::new(e.node, Span::new(l, r))
+    "requires" <e:Expr> ";" => e
 };
 
 Ensures: Spanned<Expr> = {
@@ -201,12 +221,12 @@ Params: Vec<(String, Type)> = {
     }
 };
 
-pub FnDecl: FnDecl = {
-    "func" <name:Ident> "(" <ps:Params> ")" "{" 
+pub FnDecl: Spanned<FnDecl> = {
+    <l:@L> "func" <name:Ident> "(" <ps:Params> ")" "{" 
         <req:Requires*>
         <body:Stmt*>
         <ens:Ensures*>
-    "}" => {
+    "}" <r:@R> => {
         let mut params = Vec::new();
         let mut param_names = Vec::new();
         
@@ -215,14 +235,17 @@ pub FnDecl: FnDecl = {
             param_names.push(p_name);
         }
 
-        FnDecl {
+        let node = FnDecl {
             name,
             params,
+            span: Span::new(l, r), 
             param_names,
             requires: req,
             ensures: ens,
             body,
-        }
+        };
+        
+        Spanned::new(node, Span::new(l, r))
     }
 };
 

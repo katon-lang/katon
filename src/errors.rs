@@ -21,7 +21,7 @@ pub enum VerificationError {
     PostconditionNotProven,
     InvariantNotEstablished,
     InvariantNotPreserved,
-    AssertionMayFail,
+    AssertionMayFail { details: String },
     DivisionByZero,
     ArrayIndexOutOfBounds,
     UndefinedBehavior(String),
@@ -54,7 +54,13 @@ impl fmt::Display for VerificationError {
                 write!(f, "loop invariant is not preserved by the loop body")
             }
 
-            VerificationError::AssertionMayFail => write!(f, "assertion may fail"),
+            VerificationError::AssertionMayFail { details } => {
+                if details.is_empty() {
+                    write!(f, "assertion may fail")
+                } else {
+                    write!(f, "assertion may fail (counter-example: {})", details)
+                }
+            }
 
             VerificationError::DivisionByZero => write!(f, "possible division by zero"),
 
@@ -233,7 +239,7 @@ mod tests {
     #[test]
     fn test_verification_error_is_detected() {
         let err = CheckError::VerificationError {
-            kind: VerificationError::AssertionMayFail,
+            kind: VerificationError::AssertionMayFail { details: "".into() },
         };
 
         assert!(err.is_verification_error());
@@ -267,7 +273,12 @@ mod tests {
                 VerificationError::InvariantNotPreserved,
                 "loop invariant is not preserved by the loop body",
             ),
-            (VerificationError::AssertionMayFail, "assertion may fail"),
+            (
+                VerificationError::AssertionMayFail {
+                    details: "x = -1".into(),
+                },
+                "assertion may fail (counter-example: x = -1)",
+            ),
             (
                 VerificationError::DivisionByZero,
                 "possible division by zero",
@@ -342,7 +353,9 @@ mod tests {
     fn test_diagnostic_display_verification_error() {
         let diag = Diagnostic {
             error: CheckError::VerificationError {
-                kind: VerificationError::AssertionMayFail,
+                kind: VerificationError::AssertionMayFail {
+                    details: "x = -1".into(),
+                },
             },
             span: Span::new(3, 7),
         };
@@ -350,7 +363,10 @@ mod tests {
         let msg = diag.to_string();
 
         assert!(msg.contains("Verification error"));
-        assert!(msg.contains("assertion may fail"));
+        assert_eq!(
+            msg,
+            "Verification error: assertion may fail (counter-example: x = -1)\n at Span { start: 3, end: 7 }"
+        );
     }
 
     #[test]

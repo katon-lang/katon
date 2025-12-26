@@ -45,6 +45,10 @@ impl TyCtx {
         );
     }
 
+    pub fn insert_var(&mut self, id: NodeId, ty: Type) {
+        self.node_types.insert(id, ty);
+    }
+
     /// Look up the original String name for a given NodeId.
     /// Returns a fallback string if the ID is missing (useful for debugging).
     pub fn get_name(&self, id: &NodeId) -> String {
@@ -117,7 +121,9 @@ impl Resolver {
                     });
                 }
             }
-            Stmt::Let { name, value, id } => {
+            Stmt::Let {
+                name, value, id, ..
+            } => {
                 if let Some(expr) = value {
                     self.resolve_expr(expr)?;
                 }

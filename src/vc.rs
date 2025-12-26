@@ -31,7 +31,7 @@ impl Env {
     }
 
     fn old(&self, id: NodeId, tcx: &TyCtx) -> String {
-        format!("{}_0", tcx.get_name(&id))
+        format!("{}_1", tcx.get_name(&id))
     }
 
     /// Create a fresh SSA version (immutable)
@@ -96,15 +96,20 @@ fn expr_to_smt(expr: &SExpr, env: &Env, tcx: &TyCtx, smt: &mut String) -> String
             }
         }
         Expr::ArrayLit(elems) => {
-            let mut current_array = format!("((as const (Array Int Int)) 0)");
+            // Determine the inner type of the array to create the correct 'as const'
+            // Assuming Int for now based on your logic, but we specify the sort (Int) for the value 0
+            // let mut current_array = format!("((as const (Array Int Int)) 0)");
+
+            // CHANGE: If Z3 still complains, use the fully qualified version:
+            let mut current_array = "((as const (Array Int Int)) 0)".to_string();
+
+            // Note: If your array is of Bools, this would need to be ((as const (Array Int Bool)) false)
+
             for (i, elem) in elems.iter().enumerate() {
                 let val_smt = expr_to_smt(elem, env, tcx, smt);
                 current_array = format!("(store {} {} {})", current_array, i, val_smt);
             }
 
-            // TODO:
-            // In a real system, we'd need a way to pass the literal's
-            // length (elems.len()) to the logic checking .length()
             current_array
         }
         _ => unimplemented!(),
@@ -150,11 +155,17 @@ fn type_to_smt(ty: &Type) -> String {
     match ty {
         Type::Int | Type::Nat => "Int".to_string(),
         Type::Bool => "Bool".to_string(),
-        Type::Array(inner) => format!("(Array Int {})", type_to_smt(inner)),
+        Type::Array(_size, inner) => format!("(Array Int {})", type_to_smt(inner)),
     }
 }
 
-fn process_block(stmts: &[SStmt], env: Env, smt: &mut String, tcx: &TyCtx) -> Env {
+fn process_block(
+    stmts: &[SStmt],
+    env: Env,
+    smt: &mut String,
+    tcx: &TyCtx,
+    vcs: &mut Vec<String>,
+) -> Env {
     let mut env = env;
 
     for stmt in stmts {
@@ -167,10 +178,10 @@ fn process_block(stmts: &[SStmt], env: Env, smt: &mut String, tcx: &TyCtx) -> En
                 let ty_obj = env.var_types.get(&id).unwrap();
 
                 // If target is a Nat, the new value must be >= 0
+                // Capture the entire state up to now, plus the failure condition
                 if matches!(ty_obj, Type::Nat) {
-                    smt.push_str("; Safety Check: Nat Assignment\n(push)\n");
-                    smt.push_str(&format!("(assert (not (>= {} 0)))\n", val_smt));
-                    smt.push_str("(check-sat)\n(pop)\n");
+                    let check = format!("{}\n(assert (not (>= {} 0)))\n(check-sat)", smt, val_smt);
+                    vcs.push(check);
                 }
 
                 let (env2, ver) = env.assign(id);
@@ -179,7 +190,6 @@ fn process_block(stmts: &[SStmt], env: Env, smt: &mut String, tcx: &TyCtx) -> En
 
                 smt.push_str(&format!("(declare-const {} {})\n", name, ty_smt));
                 smt.push_str(&format!("(assert (= {} {}))\n", name, val_smt));
-
                 env = env2;
             }
             Stmt::Let { value, id, .. } => {
@@ -191,9 +201,12 @@ fn process_block(stmts: &[SStmt], env: Env, smt: &mut String, tcx: &TyCtx) -> En
 
                     // Safety Check: Nat Declaration
                     if matches!(ty_obj, Type::Nat) {
-                        smt.push_str("; Safety Check: Nat Declaration\n(push)\n");
-                        smt.push_str(&format!("(assert (not (>= {} 0)))\n", val_smt));
-                        smt.push_str("(check-sat)\n(pop)\n");
+                        let check = format!(
+                            "{smt}\n(assert (not (>= {val_smt} 0)))\n(check-sat)",
+                            smt = smt,
+                            val_smt = val_smt
+                        );
+                        vcs.push(check);
                     }
 
                     // Standard SSA assignment logic
@@ -224,10 +237,20 @@ fn process_block(stmts: &[SStmt], env: Env, smt: &mut String, tcx: &TyCtx) -> En
             } => {
                 let cond_smt = expr_to_smt(cond, &env, tcx, smt);
 
-                // Process branches
-                let then_env = process_block(then_block, env.clone(), smt, tcx);
-                let else_env = process_block(else_block, env.clone(), smt, tcx);
+                // Process Then Block
+                // We pass the main 'smt' string so declarations are recorded globally,
+                // but we use a local_smt for assertions specific to this branch's safety checks.
+                let mut then_smt = smt.clone();
+                then_smt.push_str(&format!("(assert {})\n", cond_smt));
 
+                // We need process_block to update the main 'smt'
+                // with any new (declare-const) it creates.
+                let then_env = process_block(then_block, env.clone(), smt, tcx, vcs);
+
+                // Process Else Block
+                let else_env = process_block(else_block, env.clone(), smt, tcx, vcs);
+
+                // Merging (Phi functions)
                 let mut merged_env = env.clone();
                 let vars: HashSet<NodeId> = then_env
                     .versions
@@ -248,6 +271,7 @@ fn process_block(stmts: &[SStmt], env: Env, smt: &mut String, tcx: &TyCtx) -> En
                         let name = format!("{}_{}", tcx.get_name(&id), v_phi);
                         let ty = type_to_smt(merged_env.var_types.get(&id).unwrap());
 
+                        // These go into the main 'smt' string
                         smt.push_str(&format!("(declare-const {} {})\n", name, ty));
                         smt.push_str(&format!(
                             "(assert (= {} (ite {} {}_{} {}_{})))\n",
@@ -270,45 +294,49 @@ fn process_block(stmts: &[SStmt], env: Env, smt: &mut String, tcx: &TyCtx) -> En
             } => {
                 // Assert Invariant holds on Entry
                 // Does the invariant hold BEFORE the loop starts?
-                // 1. Initial Check
+                // Initial Check
                 let inv_init = expr_to_smt(invariant, &env, tcx, smt);
-                smt.push_str("; Check: Invariant on Entry\n(push)\n");
-                smt.push_str(&format!(
-                    "(assert (not {}))\n(check-sat)\n(pop)\n",
-                    inv_init
-                ));
+                let entry_check = format!("{}\n(assert (not {}))\n(check-sat)", smt, inv_init);
+                vcs.push(entry_check);
 
-                // 2. Havoc
+                // Havoc (Abstracting modified variables)
                 let modified = get_modified_vars(body);
                 let mut loop_env = env.clone();
                 for id in modified {
                     let (next, ver) = loop_env.assign(id);
                     loop_env = next;
-                    let ty = type_to_smt(loop_env.var_types.get(&id).unwrap());
+                    let ty_obj = loop_env.var_types.get(&id).unwrap();
+                    let name = format!("{}_{}", tcx.get_name(&id), ver);
+
                     smt.push_str(&format!(
-                        "(declare-const {}_{} {})\n",
-                        tcx.get_name(&id),
-                        ver,
-                        ty
+                        "(declare-const {} {})\n",
+                        name,
+                        type_to_smt(ty_obj)
                     ));
+
+                    if matches!(ty_obj, Type::Nat) {
+                        smt.push_str(&format!("(assert (>= {} 0))\n", name));
+                    }
                 }
 
-                // 3. Assume Invariant and Maintenance
+                // Assume Invariant at start of arbitrary iteration
                 let inv_head = expr_to_smt(invariant, &loop_env, tcx, smt);
                 smt.push_str(&format!("(assert {})\n", inv_head));
 
-                smt.push_str("; Check: Maintenance\n(push)\n");
+                // Check: Maintenance
                 let c_smt = expr_to_smt(cond, &loop_env, tcx, smt);
-                smt.push_str(&format!("(assert {})\n", c_smt));
+                let mut body_smt = smt.clone(); // Branching the state for the body check
+                body_smt.push_str(&format!("(assert {})\n", c_smt));
 
-                let body_env = process_block(body, loop_env.clone(), smt, tcx);
-                let inv_post = expr_to_smt(invariant, &body_env, tcx, smt);
-                smt.push_str(&format!(
-                    "(assert (not {}))\n(check-sat)\n(pop)\n",
-                    inv_post
-                ));
+                // Recursively process body to get final state for maintenance check
+                let body_env = process_block(body, loop_env.clone(), &mut body_smt, tcx, vcs);
+                let inv_post = expr_to_smt(invariant, &body_env, tcx, &mut body_smt);
 
-                // 4. Exit
+                let maintenance_check =
+                    format!("{}\n(assert (not {}))\n(check-sat)", body_smt, inv_post);
+                vcs.push(maintenance_check);
+
+                // Exit: After loop, we only know (Inv AND (NOT Cond))
                 let c_exit = expr_to_smt(cond, &loop_env, tcx, smt);
                 smt.push_str(&format!("(assert (not {}))\n", c_exit));
 
@@ -325,17 +353,20 @@ fn process_block(stmts: &[SStmt], env: Env, smt: &mut String, tcx: &TyCtx) -> En
                 let idx_smt = expr_to_smt(index, &env, tcx, smt);
                 let val_smt = expr_to_smt(value, &env, tcx, smt);
 
-                // Bounds Check
+                // 1. Safety Check: Array Bounds
                 let var_base_name = tcx.get_name(&id);
-                let len_name = format!("{}_length", var_base_name); // This refers to the const declared in compile()
+                let len_name = format!("{}_length", var_base_name);
 
-                smt.push_str("; Safety Check: Array Bounds\n(push)\n");
-                smt.push_str(&format!(
-                    "(assert (not (and (>= {0} 0) (< {0} {1}))))\n",
-                    idx_smt, len_name
-                ));
-                smt.push_str("(check-sat)\n(pop)\n");
+                // Create a standalone VC for this specific bounds check
+                let bounds_check = format!(
+                    "{smt}\n(assert (not (and (>= {idx} 0) (< {idx} {len}))))\n(check-sat)",
+                    smt = smt,
+                    idx = idx_smt,
+                    len = len_name
+                );
+                vcs.push(bounds_check);
 
+                // 2. Update the state (SSA)
                 let (next_env, ver) = env.assign(id);
                 let new_name = format!("{}_{}", tcx.get_name(&id), ver);
                 let ty_smt = type_to_smt(env.var_types.get(&id).unwrap());
@@ -354,15 +385,17 @@ fn process_block(stmts: &[SStmt], env: Env, smt: &mut String, tcx: &TyCtx) -> En
     env
 }
 
-pub fn compile(func: &FnDecl, tcx: &TyCtx) -> String {
-    let mut smt = String::from("(set-logic QF_AUFNIA)\n");
+pub fn compile(func: &FnDecl, tcx: &TyCtx) -> Vec<String> {
+    let mut smt = String::from("(set-logic ALL)\n");
+    let mut vcs = Vec::new();
     let mut env = Env::new();
 
+    // Register all types from Type Context
     for (id, ty) in &tcx.node_types {
         env.register_var(*id, ty.clone());
     }
 
-    // Declare parameters and set initial versions FIRST
+    // 1. Setup Parameters
     for (param_id, _) in &func.params {
         let (next_env, ver) = env.assign(*param_id);
         env = next_env;
@@ -370,47 +403,46 @@ pub fn compile(func: &FnDecl, tcx: &TyCtx) -> String {
         let var_name = tcx.get_name(param_id);
         let name = format!("{}_{}", var_name, ver);
         let ty_obj = env.var_types.get(param_id).unwrap();
-        let ty = type_to_smt(ty_obj);
 
-        smt.push_str(&format!("(declare-const {} {})\n", name, ty));
+        smt.push_str(&format!(
+            "(declare-const {} {})\n",
+            name,
+            type_to_smt(ty_obj)
+        ));
 
         if matches!(ty_obj, Type::Nat) {
             smt.push_str(&format!("(assert (>= {} 0))\n", name));
         }
-
-        if let Type::Array(_) = ty_obj {
+        if let Type::Array(size, _) = ty_obj {
             smt.push_str(&format!("(declare-const {}_length Int)\n", var_name));
-            smt.push_str(&format!("(assert (>= {}_length 0))\n", var_name));
+            smt.push_str(&format!("(assert (= {}_length {}))\n", var_name, size));
         }
     }
 
-    // Preconditions now refer to the correct initial versions (e.g., x_1)
-    let reqs = func
-        .requires
-        .iter()
-        .map(|r| expr_to_smt(r, &env, tcx, &mut smt))
-        .collect::<Vec<_>>();
-    if !reqs.is_empty() {
-        smt.push_str(&format!("(assert (and {}))\n", reqs.join(" ")));
+    // 2. Add Preconditions (Assumptions)
+    for req in &func.requires {
+        let req_smt = expr_to_smt(req, &env, tcx, &mut smt);
+        smt.push_str(&format!("(assert {})\n", req_smt));
     }
 
-    // Body
-    let final_env = process_block(&func.body, env, &mut smt, tcx);
+    // 3. Process Body
+    let final_env = process_block(&func.body, env, &mut smt, tcx, &mut vcs);
 
-    // Postconditions
+    // 4. Add Postconditions as Checks
     for ens in &func.ensures {
-        let post = expr_to_smt(ens, &final_env, tcx, &mut smt);
-        smt.push_str("\n; Check Postcondition\n(push)\n");
-        smt.push_str(&format!("(assert (not {}))\n(check-sat)\n(pop)\n", post));
+        let post_smt = expr_to_smt(ens, &final_env, tcx, &mut smt);
+        // A postcondition is just another safety check at the very end
+        let check = format!("{}\n(assert (not {}))\n(check-sat)", smt, post_smt);
+        vcs.push(check);
     }
 
-    smt
+    vcs
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::errors::Spanned;
+    use crate::errors::{Span, Spanned};
     use crate::runner::verify_with_z3;
 
     fn var(name: &str, id: u32) -> SExpr {
@@ -454,6 +486,7 @@ mod tests {
 
         let func = FnDecl {
             name: "abs".to_string(),
+            span: Span::dummy(),
             params: vec![(x_id, Type::Int)],
             param_names: vec!["x".to_string()],
             requires: vec![],
@@ -492,35 +525,35 @@ mod tests {
             ],
         };
 
-        let smt_output = compile(&func, &tcx);
-
+        let vcs = compile(&func, &tcx);
+        let smt_output = vcs.join("\n---\n");
         // 1. Parameters
         // compile() calls env.assign(x), so parameter is x_1
-        assert!(smt_output.contains("(declare-const x_1 Int)"));
+        assert!(smt_output.contains(&"(declare-const x_1 Int)".to_string()));
 
         // 2. First assignment: y = x
         // env.assign(y) creates y_1
-        assert!(smt_output.contains("(declare-const y_1 Int)"));
-        assert!(smt_output.contains("(= y_1 x_1)"));
+        assert!(smt_output.contains(&"(declare-const y_1 Int)".to_string()));
+        assert!(smt_output.contains(&"(= y_1 x_1)".to_string()));
 
         // 3. Inside branches
         // "then" block calls env.assign(y) -> y_2
-        assert!(smt_output.contains("(declare-const y_2 Int)"));
-        assert!(smt_output.contains("(= y_2 (- 0 x_1))"));
+        assert!(smt_output.contains(&"(declare-const y_2 Int)".to_string()));
+        assert!(smt_output.contains(&"(= y_2 (- 0 x_1))".to_string()));
 
         // "else" block calls env.assign(y) -> y_3
-        assert!(smt_output.contains("(declare-const y_3 Int)"));
-        assert!(smt_output.contains("(= y_3 x_1)"));
+        assert!(smt_output.contains(&"(declare-const y_3 Int)".to_string()));
+        assert!(smt_output.contains(&"(= y_3 x_1)".to_string()));
 
         // 4. THE PHI MERGE
         // process_block detects y changed in branches and creates a new version y_4
-        assert!(smt_output.contains("(declare-const y_4 Int)"));
-        assert!(smt_output.contains("(assert (= y_4 (ite (< x_1 0) y_2 y_3)))"));
+        assert!(smt_output.contains(&"(declare-const y_4 Int)".to_string()));
+        assert!(smt_output.contains(&"(assert (= y_4 (ite (< x_1 0) y_2 y_3)))".to_string()));
 
         // 5. POSTCONDITION
         // The final_env has y at version 4.
-        assert!(smt_output.contains("(assert (not (>= y_4 0)))"));
-        assert!(smt_output.contains("(check-sat)"));
+        assert!(smt_output.contains(&"(assert (not (>= y_4 0)))".to_string()));
+        assert!(smt_output.contains(&"(check-sat)".to_string()));
     }
 
     #[test]
@@ -544,6 +577,7 @@ mod tests {
 
         let func = FnDecl {
             name: "buggy_loop".to_string(),
+            span: Span::dummy(),
             param_names: vec!["n".to_string()],
             params: vec![(n_id, Type::Int)],
             requires: vec![bin(var("n", 0), Op::Gt, int(0))],
@@ -569,8 +603,7 @@ mod tests {
             ensures: vec![],
         };
 
-        let smt = compile(&func, &tcx);
-        let result = verify_with_z3(&smt);
+        let result = verify_with_z3(&func, &tcx);
 
         // Z3 will find that if i=0 and we do i = i - 1, then i becomes -1.
         // -1 >= 0 is FALSE, so the invariant is violated.
@@ -592,12 +625,13 @@ mod tests {
         let mut tcx = TyCtx::new();
         let arr_id = NodeId(0);
 
-        tcx.define_local(arr_id, "arr", Type::Array(Box::new(Type::Int)));
+        tcx.define_local(arr_id, "arr", Type::Array(99, Box::new(Type::Int)));
 
         let func = FnDecl {
             name: "update".to_string(),
+            span: Span::dummy(),
             param_names: vec!["arr".to_string()],
-            params: vec![(arr_id, Type::Array(Box::new(Type::Int)))],
+            params: vec![(arr_id, Type::Array(99, Box::new(Type::Int)))],
             requires: vec![],
             body: vec![Spanned::dummy(Stmt::ArrayUpdate {
                 target: "arr".to_string(),
@@ -617,10 +651,12 @@ mod tests {
             ],
         };
 
-        let smt = compile(&func, &tcx);
-        assert!(smt.contains("(declare-const arr_1 (Array Int Int))"));
-        assert!(smt.contains("(declare-const arr_2 (Array Int Int))"));
-        assert!(smt.contains("(= arr_2 (store arr_1 0 99))"));
-        assert!(smt.contains("(select arr_2 0)"));
+        let vcs = compile(&func, &tcx);
+        let smt = vcs.join("\n\n");
+
+        assert!(smt.contains(&"(declare-const arr_1 (Array Int Int))".to_string()));
+        assert!(smt.contains(&"(declare-const arr_2 (Array Int Int))".to_string()));
+        assert!(smt.contains(&"(= arr_2 (store arr_1 0 99))".to_string()));
+        assert!(smt.contains(&"(select arr_2 0)".to_string()));
     }
 }

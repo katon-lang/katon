@@ -16,8 +16,8 @@ mod tests {
     use super::errors::{CheckError, Span, Spanned};
     use super::katon;
     use super::runner;
-    use super::symbol_table::TyCtx;
-    use super::vc;
+    use super::symbol_table::{Resolver, TyCtx};
+    use super::typecheck::TypeChecker;
 
     fn var(name: &str, id: Option<u32>) -> SExpr {
         Spanned::dummy(Expr::Var(name.to_string(), id.map(NodeId)))
@@ -171,18 +171,19 @@ mod tests {
 
         let func = parser.parse(code).unwrap();
 
-        assert_eq!(func.name, "transfer");
+        assert_eq!(func.node.name, "transfer");
 
         let param_types: Vec<Type> = func
+            .node
             .params
             .iter()
             .map(|(_, ty): &(NodeId, Type)| ty.clone())
             .collect();
 
         assert_eq!(param_types, vec![Type::Int, Type::Int, Type::Int]);
-        assert_eq!(func.requires.len(), 2); // Two requires statements
-        assert_eq!(func.body.len(), 2); // Two assignments
-        assert_eq!(func.ensures.len(), 1); // One ensures statement
+        assert_eq!(func.node.requires.len(), 2);
+        assert_eq!(func.node.body.len(), 2);
+        assert_eq!(func.node.ensures.len(), 1);
     }
 
     #[test]
@@ -201,6 +202,7 @@ mod tests {
 
         let func = FnDecl {
             name: "Vacuous".to_string(),
+            span: Span::dummy(),
             param_names: vec!["x".to_string()],
             params: vec![(x_id, Type::Nat)],
             requires: vec![
@@ -215,9 +217,7 @@ mod tests {
             ensures: vec![bin(var("x", Some(0)), Op::Eq, int(0))],
         };
 
-        // This must PASS Z3
-        let smt = vc::compile(&func, &tcx);
-        let result = runner::verify_with_z3(&smt);
+        let result = runner::verify_with_z3(&func, &tcx);
         assert!(
             result.is_ok(),
             "Vacuous truth failed: Impossible preconditions should verify anything."
@@ -243,6 +243,7 @@ mod tests {
 
         let func = FnDecl {
             name: "BrokenScope".to_string(),
+            span: Span::dummy(),
             params: vec![(c_id, Type::Int)],
             param_names: vec!["c".to_string()],
             requires: vec![],
@@ -303,6 +304,7 @@ mod tests {
 
         let func = FnDecl {
             name: "Nested".to_string(),
+            span: Span::dummy(),
             param_names: vec!["x".to_string()],
             params: vec![(x_id, Type::Int)],
             requires: vec![],
@@ -330,23 +332,24 @@ mod tests {
             ensures: vec![bin(var("x", Some(0)), Op::Eq, int(1))],
         };
 
-        let smt = vc::compile(&func, &tcx);
-        let result = runner::verify_with_z3(&smt);
+        let result = runner::verify_with_z3(&func, &tcx);
         assert!(result.is_ok(), "Nested IF logic failed verification.");
     }
 
     #[test]
     fn test_integer_division_math() {
-        // func Math(x int) {
+        // func Math(x: int) {
         //    requires x > 0
         //    y = x * x
         //    z = y / x
         //    ensures z == x
         // }
+        //
         // Note: In SMT-LIB (div x y) is Euclidean division.
         // For positive numbers, this identity should hold.
 
         let mut tcx = TyCtx::new();
+        let mut resolver = Resolver::new();
 
         let x_id = NodeId(0);
         let y_id = NodeId(1);
@@ -356,31 +359,36 @@ mod tests {
         tcx.define_local(y_id, "y", Type::Int);
         tcx.define_local(z_id, "z", Type::Int);
 
-        let func = FnDecl {
+        let mut func = FnDecl {
             name: "Math".to_string(),
+            span: Span::dummy(),
             param_names: vec!["x".to_string()],
-            params: vec![(x_id, Type::Int)],
-            requires: vec![bin(var("x", Some(0)), Op::Gt, int(0))],
+            params: vec![(NodeId(0), Type::Int)],
+            requires: vec![bin(var("x", None), Op::Gt, int(0))],
             body: vec![
-                Spanned::dummy(Stmt::Assign {
-                    target: "y".to_string(),
-                    target_id: Some(y_id),
-                    value: bin(var("x", Some(0)), Op::Mul, var("x", Some(0))),
+                Spanned::dummy(Stmt::Let {
+                    name: "y".to_string(),
+                    ty: Some(Type::Int),
+                    value: Some(bin(var("x", None), Op::Mul, var("x", None))),
+                    id: None,
                 }),
-                Spanned::dummy(Stmt::Assign {
-                    target: "z".to_string(),
-                    target_id: Some(z_id),
-                    value: bin(var("y", Some(0)), Op::Div, var("x", Some(0))),
+                Spanned::dummy(Stmt::Let {
+                    name: "z".to_string(),
+                    ty: Some(Type::Int),
+                    value: Some(bin(var("y", None), Op::Div, var("x", None))),
+                    id: None,
                 }),
             ],
-            ensures: vec![bin(var("z", Some(0)), Op::Eq, var("x", Some(0)))],
+            ensures: vec![bin(var("z", None), Op::Eq, var("x", None))],
         };
 
-        let smt = vc::compile(&func, &tcx);
+        resolver.resolve_function(&mut func, &mut tcx).unwrap();
 
-        println!("{}", smt);
-        let result = runner::verify_with_z3(&smt);
-        assert!(result.is_ok(), "Integer division logic failed.");
+        let mut tc = TypeChecker::new(&mut tcx);
+        tc.check_fn(&func).unwrap();
+
+        let result = runner::verify_with_z3(&func, &tcx);
+        assert!(result.is_ok());
     }
 
     #[test]
@@ -400,6 +408,7 @@ mod tests {
 
         let func = FnDecl {
             name: "BadLoop".to_string(),
+            span: Span::dummy(),
             param_names: vec!["x".to_string()],
             params: vec![(x_id, Type::Int)],
             requires: vec![],
@@ -422,8 +431,7 @@ mod tests {
             ],
         };
 
-        let smt = vc::compile(&func, &tcx);
-        let result = runner::verify_with_z3(&smt);
+        let result = runner::verify_with_z3(&func, &tcx);
 
         // We EXPECT this to fail.
         assert!(

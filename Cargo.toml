@@ -4,8 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-ariadne = "0.6.0"
 lalrpop-util = { version = "0.22.2", features = ["lexer"] }
+z3 = "0.19.6"
 
 [build-dependencies]
 lalrpop = "0.22.2"

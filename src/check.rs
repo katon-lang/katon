@@ -43,7 +43,7 @@ impl BorrowChecker {
     fn is_copy(&self, ty: &Type) -> bool {
         match ty {
             Type::Int | Type::Nat | Type::Bool => true, // Primitives copy
-            Type::Array(_) => false,                    // Array moves
+            Type::Array(_, _) => false,                 // Array moves
         }
     }
 
@@ -69,7 +69,9 @@ impl BorrowChecker {
                 self.id_to_name.insert(id, target.clone());
                 Ok(())
             }
-            Stmt::Let { name, value, id } => {
+            Stmt::Let {
+                name, value, id, ..
+            } => {
                 let id = id.expect("Resolver should have assigned ID");
 
                 // Only check the expression if it exists (Value is Some)
@@ -194,7 +196,7 @@ impl BorrowChecker {
                     }
 
                     // Rule: Must actually be an Array type
-                    if !matches!(ty, Type::Array(_)) {
+                    if !matches!(ty, Type::Array(_, _)) {
                         return Err(Diagnostic {
                             error: CheckError::InvalidIndex {
                                 base_ty: ty.clone(),
@@ -313,7 +315,7 @@ impl BorrowChecker {
 mod tests {
     use crate::{
         ast::{Op, Type},
-        errors::Spanned,
+        errors::{Span, Spanned},
     };
 
     use super::*;
@@ -357,6 +359,7 @@ mod tests {
 
         let func = FnDecl {
             name: "test".to_string(),
+            span: Span::dummy(),
             param_names: vec!["x".to_string()],
             params: vec![(x_id, Type::Int)],
             requires: vec![],
@@ -405,6 +408,7 @@ mod tests {
 
         let func = FnDecl {
             name: "math_test".to_string(),
+            span: Span::dummy(),
             param_names: vec!["x".to_string()],
             params: vec![(x_id, Type::Int), (y_id, Type::Nat)],
             requires: vec![],
@@ -453,6 +457,7 @@ mod tests {
 
         let func = FnDecl {
             name: "scope_leak".to_string(),
+            span: Span::dummy(),
             param_names: vec!["x".to_string()],
             params: vec![(x_id, Type::Int)],
             requires: vec![],
@@ -514,6 +519,7 @@ mod tests {
 
         let func = FnDecl {
             name: "merge_valid".to_string(),
+            span: Span::dummy(),
             param_names: vec!["cond".to_string()],
             params: vec![(cond_id, Type::Int)],
             requires: vec![],
@@ -564,8 +570,9 @@ mod tests {
 
         let func = FnDecl {
             name: "bad_var".to_string(),
+            span: Span::dummy(),
             param_names: vec![],
-            params: vec![], // No params
+            params: vec![],
             requires: vec![],
             ensures: vec![],
             body: vec![Spanned::dummy(Stmt::Assign {
@@ -585,7 +592,7 @@ mod tests {
     #[test]
     fn test_move_in_one_branch() {
         // SCENARIO:
-        // func test(arr []int, c int) {
+        // func test(arr [0; int], c int) {
         //    if c > 0 {
         //       let b = arr; // arr is MOVED here
         //    } else {
@@ -600,13 +607,14 @@ mod tests {
 
         let arr_id = NodeId(0);
         let c_id = NodeId(1);
-        let arr_type = Type::Array(Box::new(Type::Int));
+        let arr_type = Type::Array(0, Box::new(Type::Int));
 
         tcx.define_local(arr_id, "arr", arr_type.clone());
         tcx.define_local(c_id, "c", Type::Int);
 
         let func = FnDecl {
             name: "test_move".to_string(),
+            span: Span::dummy(),
             param_names: vec!["arr".to_string(), "c".to_string()],
             params: vec![(arr_id, arr_type), (c_id, Type::Int)],
             requires: vec![],

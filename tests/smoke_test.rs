@@ -1,6 +1,8 @@
 #[cfg(test)]
 mod tests {
+    use katon::ast::FnDecl;
     use katon::check::BorrowChecker;
+    use katon::errors::{Diagnostic, Spanned};
     use katon::katon::FnDeclParser;
     use katon::runner::verify_with_z3;
     use katon::symbol_table::{Resolver, TyCtx};
@@ -14,7 +16,8 @@ mod tests {
             fs::read_to_string(file_path).map_err(|e| format!("Failed to read the file {}", e))?;
 
         let parser = FnDeclParser::new();
-        let mut fn_decl = parser
+
+        let mut fn_decl: Spanned<FnDecl> = parser
             .parse(&source)
             .map_err(|e| format!("Parser error: {}", e))?;
 
@@ -23,30 +26,37 @@ mod tests {
 
         // Resolve names
         resolver
-            .resolve_function(&mut fn_decl, &mut tcx)
+            .resolve_function(&mut fn_decl.node, &mut tcx)
             .map_err(|e| format!("Resolution Error: {:?}", e.error))?;
 
         // Run Type Checker
         // Note: New takes &mut tcx, check_fn takes ONLY &fn_decl
         let mut type_checker = TypeChecker::new(&mut tcx);
         type_checker
-            .check_fn(&fn_decl)
+            .check_fn(&fn_decl.node)
             .map_err(|e| format!("Type Error: {:?}", e.error))?;
 
         // Run Borrow Checker
         // Note: New takes nothing, check_fn takes BOTH &fn_decl and &mut tcx
         let mut bc = BorrowChecker::new();
-        bc.check_fn(&fn_decl, &mut tcx)
+        bc.check_fn(&fn_decl.node, &mut tcx)
             .map_err(|e| format!("Borrow Error: {:?}", e.error))?;
 
         // Generate SMT
-        let smt_code = compile(&fn_decl, &tcx);
-        if let Err(e) = verify_with_z3(&smt_code) {
-            println!("FAILED SMT:\n{}", smt_code); // Look for the (check-sat) that returns 'sat'
-            return Err(format!("Verification Error: {}", e));
-        }
+        let _smt_code = compile(&fn_decl.node, &tcx);
 
-        Ok(())
+        // When calling the verifier, pass the node inside
+        match verify_with_z3(&fn_decl.node, &tcx) {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                let diag = Diagnostic {
+                    error: e,
+                    span: fn_decl.span,
+                };
+                diag.emit(&source);
+                Err("Verification failed".to_string())
+            }
+        }
     }
 
     #[test]

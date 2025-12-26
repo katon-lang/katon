@@ -2,8 +2,11 @@ func main(n: nat) {
     let i: nat = 0;
     let sum: nat = 0;
     
-    while i < n {
-        invariant sum >= 0; // The solver must prove this holds every iteration
+    // We must prove i >= 0 stays true so the sum stays true!
+    while i < n 
+    invariant sum >= 0
+    invariant i >= 0
+    {
         sum = sum + i;
         i = i + 1;
     }

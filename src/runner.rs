@@ -1,49 +1,37 @@
-use std::io::Write;
-use std::process::{Command, Stdio};
+use crate::ast::FnDecl;
+use crate::errors::{CheckError, VerificationError};
+use crate::symbol_table::TyCtx;
+use crate::vc::compile;
+use z3::*;
 
-pub fn verify_with_z3(smt_code: &str) -> Result<(), String> {
-    let mut child = Command::new("z3")
-        .arg("-in")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .map_err(|_| "Could not find 'z3' binary")?;
+pub fn verify_with_z3(func: &FnDecl, tcx: &TyCtx) -> Result<(), CheckError> {
+    let solver = Solver::new();
 
-    child
-        .stdin
-        .as_mut()
-        .ok_or("Failed to open stdin")?
-        .write_all(smt_code.as_bytes())
-        .map_err(|e| e.to_string())?;
+    let vcs = compile(func, tcx);
 
-    let output = child.wait_with_output().map_err(|e| e.to_string())?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    for (i, vc_text) in vcs.iter().enumerate() {
+        // Debug:
+        // println!("--- VC {} ---\n{}", i, vc_text);
 
-    // Check process exit code
-    if !output.status.success() {
-        return Err(format!("Z3 crashed or failed: {}", stdout));
-    }
+        solver.push(); // Use solver stack or reset for clean state
+        solver.from_string(vc_text.as_str());
 
-    let mut verification_count = 0;
-
-    for line in stdout.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
+        match solver.check() {
+            SatResult::Sat => {
+                let model = solver.get_model().unwrap();
+                return Err(CheckError::VerificationError {
+                    kind: VerificationError::AssertionMayFail {
+                        details: format!("Counter-example for Check #{}:\n{}", i, model),
+                    },
+                });
+            }
+            SatResult::Unknown => {
+                return Err(CheckError::InternalError("Z3 returned Unknown".to_string()));
+            }
+            SatResult::Unsat => {
+                solver.pop(1);
+            }
         }
-
-        if trimmed == "sat" {
-            return Err("Verification Failed: Counter-example found".to_string());
-        } else if trimmed == "unsat" {
-            verification_count += 1;
-        } else if trimmed.starts_with("(error") {
-            return Err(format!("Z3 Error: {}", trimmed));
-        }
-    }
-
-    // Ensure we actually ran something
-    if verification_count == 0 {
-        return Err("Z3 produced no output (empty SMT?)".to_string());
     }
 
     Ok(())

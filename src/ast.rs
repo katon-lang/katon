@@ -1,4 +1,4 @@
-use crate::errors::Spanned;
+use crate::errors::{Span, Spanned};
 use std::fmt::{Display, Formatter, Result};
 
 pub type SExpr = Spanned<Expr>;
@@ -39,6 +39,7 @@ pub enum Expr {
 pub enum Stmt {
     Let {
         name: String,
+        ty: Option<Type>,
         value: Option<SExpr>,
         id: Option<NodeId>,
     },
@@ -70,7 +71,7 @@ pub enum Type {
     Int,
     Nat,
     Bool,
-    Array(Box<Type>),
+    Array(usize, Box<Type>),
 }
 
 impl Display for Type {
@@ -79,10 +80,11 @@ impl Display for Type {
             Type::Int => write!(f, "int"),
             Type::Nat => write!(f, "nat"),
             Type::Bool => write!(f, "bool"),
-            Type::Array(inner) => write!(f, "[{}]", inner),
+            Type::Array(size, inner) => write!(f, "[{}; {}]", size, inner),
         }
     }
 }
+
 pub struct FnDecl {
     pub name: String,
     pub params: Vec<(NodeId, Type)>,
@@ -90,4 +92,5 @@ pub struct FnDecl {
     pub requires: Vec<SExpr>,
     pub ensures: Vec<SExpr>,
     pub body: Vec<SStmt>,
+    pub span: Span,
 }

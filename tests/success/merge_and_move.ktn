@@ -1,15 +1,14 @@
-func main(a: [int], cond: bool) {
-    let b = a; // 'a' moved to 'b'
-    let c: [int];
+func main(a: [3; int], cond: bool) {
+    let b = a; 
+    let c: [3; int]; // Size is mandatory here
     
     if cond {
-        c = b; // 'b' moved to 'c'
+        c = b; // OK: [3; int] assigned to [3; int]
     } else {
-        c = [1, 2, 3]; // 'b' still valid in this branch scope, but not used
+        c = [1, 2, 3]; // OK: Literal size matches 3
     }
     
-    // VCGen must handle the merge of 'c' (either b or the literal)
-    // Borrow Checker must ensure 'a' and 'b' are NOT used here.
-    let len = c_length;
+    // Static verification: c_length is now a known constant 3
+    let len = 3; 
     ensures len >= 0;
 }

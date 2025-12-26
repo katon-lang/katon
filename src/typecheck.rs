@@ -24,6 +24,23 @@ impl<'a> TypeChecker<'a> {
         Ok(())
     }
 
+    fn check_compatibility(&self, expected: &Type, found: &Type) -> bool {
+        if expected == found {
+            return true;
+        }
+
+        // Allow assigning Int to Nat (Z3 will prove it's >= 0)
+        if matches!(expected, Type::Nat) && matches!(found, Type::Int) {
+            return true;
+        }
+
+        // Allow assigning Nat to Int
+        if matches!(expected, Type::Int) && matches!(found, Type::Nat) {
+            return true;
+        }
+        false
+    }
+
     fn is_integer_type(&self, ty: &Type) -> bool {
         matches!(ty, Type::Int | Type::Nat)
     }
@@ -66,27 +83,41 @@ impl<'a> TypeChecker<'a> {
 
     fn check_stmt(&mut self, stmt: &SStmt) -> Result<(), Diagnostic> {
         match &stmt.node {
-            Stmt::Let { value, id, .. } => {
+            Stmt::Let { ty, value, id, .. } => {
                 let id = id.expect("Resolver must assign ID");
 
-                match value {
-                    Some(expr) => {
-                        // Inference: let x = 5;
-                        let ty = self.check_expr(expr)?;
-                        self.tcx.node_types.insert(id, ty);
+                match (ty, value) {
+                    // let c: [int];
+                    (Some(t), None) => {
+                        self.tcx.insert_var(id, t.clone());
                     }
-                    None => {
-                        // Declaration: let x: int;
-                        // The Resolver should have already put the type in node_types
-                        // based on the `: Type` syntax in the grammar.
-                        if !self.tcx.node_types.contains_key(&id) {
-                            return Err(self.type_error(
-                                "variable declaration lacks type annotation",
-                                stmt.span,
-                            ));
+
+                    // let b = a;
+                    (None, Some(expr)) => {
+                        let t = self.check_expr(expr)?;
+                        self.tcx.insert_var(id, t);
+                    }
+
+                    // let x: int = expr;
+                    (Some(t), Some(expr)) => {
+                        let expr_t = self.check_expr(expr)?;
+                        if !self.check_compatibility(t, &expr_t) {
+                            return Err(Diagnostic {
+                                error: CheckError::TypeMismatch {
+                                    expected: t.clone(),
+                                    found: expr_t,
+                                },
+                                span: stmt.span,
+                            });
                         }
+
+                        self.tcx.insert_var(id, t.clone());
                     }
+
+                    // impossible by grammar
+                    (None, None) => unreachable!("parser prevents this"),
                 }
+
                 Ok(())
             }
             Stmt::Assign {
@@ -102,7 +133,7 @@ impl<'a> TypeChecker<'a> {
                     .cloned()
                     .ok_or(self.type_error("assign to untyped variable", stmt.span))?;
 
-                if lhs_ty != rhs_ty {
+                if !self.check_compatibility(&lhs_ty, &rhs_ty) {
                     return Err(Diagnostic {
                         error: CheckError::TypeMismatch {
                             expected: lhs_ty,
@@ -111,6 +142,7 @@ impl<'a> TypeChecker<'a> {
                         span: stmt.span,
                     });
                 }
+
                 Ok(())
             }
             Stmt::If {
@@ -139,6 +171,7 @@ impl<'a> TypeChecker<'a> {
                 if self.check_expr(cond)? != Type::Bool {
                     return Err(self.type_error("while condition must be Bool", cond.span));
                 }
+
                 if self.check_expr(invariant)? != Type::Bool {
                     return Err(self.type_error("loop invariant must be Bool", invariant.span));
                 }
@@ -146,6 +179,7 @@ impl<'a> TypeChecker<'a> {
                 for s in body {
                     self.check_stmt(s)?;
                 }
+
                 Ok(())
             }
             Stmt::ArrayUpdate {
@@ -155,7 +189,6 @@ impl<'a> TypeChecker<'a> {
                 ..
             } => {
                 let id = target_id.expect("Resolver must assign ID");
-
                 let arr_ty = self
                     .tcx
                     .node_types
@@ -163,28 +196,44 @@ impl<'a> TypeChecker<'a> {
                     .cloned()
                     .ok_or(self.type_error("update of untyped variable", stmt.span))?;
 
-                let idx_ty = self.check_expr(index)?;
+                // Check if the target is actually an array and extract size/inner type
+                let (arr_size, inner_ty) = match arr_ty {
+                    Type::Array(size, inner) => (size, inner),
+                    other => {
+                        return Err(Diagnostic {
+                            error: CheckError::InvalidIndex { base_ty: other },
+                            span: stmt.span,
+                        });
+                    }
+                };
 
-                if !self.is_integer_type(&idx_ty) {
-                    return Err(self.type_error("array index must be Int or Nat", index.span));
+                // Static Bound Checking
+                match index.node {
+                    Expr::IntLit(idx_val) if idx_val < 0 || idx_val as usize >= arr_size => {
+                        return Err(self.type_error(
+                            &format!(
+                                "index {} out of bounds for array of size {}",
+                                idx_val, arr_size
+                            ),
+                            index.span,
+                        ));
+                    }
+                    _ => {} // Do nothing if it's not a literal or if it's in bounds
                 }
 
+                // Type consistency
                 let val_ty = self.check_expr(value)?;
-
-                match arr_ty {
-                    Type::Array(inner) if *inner == val_ty => Ok(()),
-                    Type::Array(inner) => Err(Diagnostic {
+                if val_ty != *inner_ty {
+                    return Err(Diagnostic {
                         error: CheckError::TypeMismatch {
-                            expected: *inner,
+                            expected: *inner_ty,
                             found: val_ty,
                         },
-                        span: stmt.span,
-                    }),
-                    other => Err(Diagnostic {
-                        error: CheckError::InvalidIndex { base_ty: other },
-                        span: stmt.span,
-                    }),
+                        span: value.span,
+                    });
                 }
+
+                Ok(())
             }
         }
     }
@@ -218,7 +267,23 @@ impl<'a> TypeChecker<'a> {
                 }
 
                 match self.check_expr(l)? {
-                    Type::Array(inner) => *inner,
+                    Type::Array(size, inner) => {
+                        // Static Bound Checking: If the index is a literal, check it now
+                        match r.node {
+                            Expr::IntLit(val) if val < 0 || (val as usize) >= size => {
+                                return Err(self.type_error(
+                                    &format!(
+                                        "index {} is out of bounds for array of size {}",
+                                        val, size
+                                    ),
+                                    r.span,
+                                ));
+                            }
+                            _ => {}
+                        }
+
+                        *inner
+                    }
                     other => {
                         return Err(Diagnostic {
                             error: CheckError::InvalidIndex { base_ty: other },
@@ -230,6 +295,15 @@ impl<'a> TypeChecker<'a> {
             Expr::Binary(l, op, r) => {
                 let lt = self.check_expr(l)?;
                 let rt = self.check_expr(r)?;
+
+                if self.is_integer_type(&lt) && self.is_integer_type(&rt) {
+                    match op {
+                        Op::Eq | Op::Neq | Op::Gt | Op::Lt | Op::Gte | Op::Lte => {
+                            return Ok(Type::Bool);
+                        }
+                        _ => return Ok(Type::Int), // Math results in Int
+                    }
+                }
 
                 if lt != rt {
                     return Err(Diagnostic {
@@ -248,11 +322,12 @@ impl<'a> TypeChecker<'a> {
             }
             Expr::ArrayLit(elems) => {
                 if elems.is_empty() {
-                    return Ok(Type::Array(Box::new(Type::Int)));
+                    // Decide a default for empty literals, or enforce explicit typing
+                    return Ok(Type::Array(0, Box::new(Type::Int)));
                 }
 
                 let first_ty = self.check_expr(&elems[0])?;
-                for (_i, elem) in elems.iter().enumerate().skip(1) {
+                for elem in elems.iter().skip(1) {
                     let ty = self.check_expr(elem)?;
                     if ty != first_ty {
                         return Err(Diagnostic {
@@ -265,7 +340,8 @@ impl<'a> TypeChecker<'a> {
                     }
                 }
 
-                Type::Array(Box::new(first_ty))
+                // Capture the ACTUAL length of the literal as part of the type
+                Type::Array(elems.len(), Box::new(first_ty))
             }
         };
 
@@ -306,11 +382,12 @@ mod tests {
         let stmt = SStmt {
             node: Stmt::Let {
                 id: Some(NodeId(1)),
+                ty: Some(Type::Int),
                 name: "let".to_string(),
-                value: SExpr {
+                value: Some(SExpr {
                     node: Expr::IntLit(42),
                     span: Span::dummy(),
-                },
+                }),
             },
             span: Span::dummy(),
         };
@@ -352,22 +429,24 @@ mod tests {
                 then_block: vec![SStmt {
                     node: Stmt::Let {
                         id: Some(NodeId(1)),
+                        ty: Some(Type::Int),
                         name: "if".to_string(),
-                        value: SExpr {
+                        value: Some(SExpr {
                             node: Expr::IntLit(1),
                             span: Span::dummy(),
-                        },
+                        }),
                     },
                     span: Span::dummy(),
                 }],
                 else_block: vec![SStmt {
                     node: Stmt::Let {
                         id: Some(NodeId(1)),
+                        ty: Some(Type::Int),
                         name: "else".to_string(),
-                        value: SExpr {
+                        value: Some(SExpr {
                             node: Expr::BoolLit(false),
                             span: Span::dummy(),
-                        },
+                        }),
                     },
                     span: Span::dummy(),
                 }],

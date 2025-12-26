@@ -1,4 +1,4 @@
-func swap(a: [int], i: nat, j: nat) {
+func swap(a: [99; int], i: nat, j: nat) {
     // Both i and j must be within the actual bounds of array 'a'
     requires i < a_length && j < a_length; 
     
