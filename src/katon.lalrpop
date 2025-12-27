@@ -62,6 +62,13 @@ Unary: Spanned<Expr> = {
         let zero = Spanned::new(Expr::IntLit(0), Span::new(l, l));
         Spanned::new(Expr::Binary(Box::new(zero), Op::Sub, Box::new(u)), Span::new(l, r))
     },
+    "&" <u:Unary> <r:@R> => {
+        let l = u.span.start;
+        Spanned::new(
+            Expr::Borrow(Box::new(u)),
+            Span::new(l, r)
+        )
+    },
     Postfix,
 };
 
@@ -97,6 +104,15 @@ Atom: Spanned<Expr> = {
     "false" => Spanned::dummy(Expr::BoolLit(false)),
     <l:@L> "[" <elems:Comma<Expr>> "]" <r:@R> => 
         Spanned::new(Expr::ArrayLit(elems), Span::new(l, r)),
+    <l:@L> "update" "(" <base:Expr> "," <idx:Expr> "," <val:Expr> ")" <r:@R> =>
+    Spanned::new(
+        Expr::Update {
+            base: Box::new(base),
+            index: Some(Box::new(idx)),
+            value: Some(Box::new(val)),
+        },
+        Span::new(l, r)
+    ),
 };
 
 Comma<T>: Vec<T> = {

@@ -344,6 +344,43 @@ impl<'a> TypeChecker<'a> {
                 // Capture the ACTUAL length of the literal as part of the type
                 Type::Array(elems.len(), Box::new(first_ty))
             }
+            Expr::Borrow(inner) => self.check_expr(inner)?,
+            Expr::Update { base, index, value } => {
+                let base_ty = self.check_expr(base)?;
+
+                match base_ty {
+                    Type::Array(size, inner) => {
+                        let idx = index.as_ref().expect("array update needs index");
+                        let val = value.as_ref().expect("array update needs value");
+
+                        let idx_ty = self.check_expr(idx)?;
+                        if !self.is_integer_type(&idx_ty) {
+                            return Err(self.type_error("index must be Int or Nat", idx.span));
+                        }
+
+                        let val_ty = self.check_expr(val)?;
+                        if val_ty != *inner {
+                            return Err(Diagnostic {
+                                error: CheckError::TypeMismatch {
+                                    expected: *inner,
+                                    found: val_ty,
+                                },
+                                span: val.span,
+                            });
+                        }
+
+                        // update(...) returns SAME array type
+                        Type::Array(size, inner)
+                    }
+
+                    other => {
+                        return Err(Diagnostic {
+                            error: CheckError::InvalidIndex { base_ty: other },
+                            span: expr.span,
+                        });
+                    }
+                }
+            }
         };
 
         Ok(ty)

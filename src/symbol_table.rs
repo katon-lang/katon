@@ -10,6 +10,7 @@ use katon_core::errors::{CheckError, Diagnostic};
 pub struct TyCtx {
     pub resolutions: HashMap<NodeId, Definition>,
     pub node_types: HashMap<NodeId, Type>,
+    pub borrows: HashMap<NodeId, NodeId>,
 }
 
 impl Default for TyCtx {
@@ -23,6 +24,7 @@ impl TyCtx {
         Self {
             resolutions: HashMap::new(),
             node_types: HashMap::new(),
+            borrows: HashMap::new(),
         }
     }
 
@@ -228,6 +230,20 @@ impl Resolver {
                         span: expr.span,
                     })
                 }
+            }
+            Expr::Borrow(inner) => self.resolve_expr(inner),
+            Expr::Update { base, index, value } => {
+                self.resolve_expr(base)?;
+
+                if let Some(i) = index {
+                    self.resolve_expr(i)?;
+                }
+
+                if let Some(v) = value {
+                    self.resolve_expr(v)?;
+                }
+
+                Ok(())
             }
             _ => Ok(()),
         }

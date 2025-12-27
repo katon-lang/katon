@@ -32,6 +32,12 @@ pub enum Expr {
     Binary(Box<SExpr>, Op, Box<SExpr>),
     Cast(Type, Box<SExpr>),
     ArrayLit(Vec<SExpr>),
+    Borrow(Box<SExpr>),
+    Update {
+        base: Box<SExpr>,
+        index: Option<Box<SExpr>>,
+        value: Option<Box<SExpr>>,
+    },
 }
 
 #[derive(Debug, Clone)]

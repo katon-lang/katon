@@ -59,6 +59,15 @@ impl BorrowChecker {
                 // Get the unique ID for this target
                 let id = target_id.expect("Resolver should have caught this");
 
+                if tcx.borrows.contains_key(&id) {
+                    return Err(Diagnostic {
+                        error: CheckError::AssignToMoved {
+                            var: target.clone(),
+                        },
+                        span: stmt.span,
+                    });
+                }
+
                 // Get the type from the global type table (populated by inference or decls)
                 let ty = tcx.node_types.get(&id).cloned().unwrap_or(Type::Int);
 
@@ -181,6 +190,15 @@ impl BorrowChecker {
 
                 let id = target_id.expect("Resolver should have assigned an ID to array target");
 
+                if tcx.borrows.contains_key(&id) {
+                    return Err(Diagnostic {
+                        error: CheckError::AssignToMoved {
+                            var: target.clone(),
+                        },
+                        span: stmt.span,
+                    });
+                }
+
                 // 3. Verify the Array itself is Valid
                 if let Some((is_alive, ty)) = self.scope.get(&id) {
                     // Rule: Katon cannot modify a moved array
@@ -232,7 +250,13 @@ impl BorrowChecker {
                     });
                 }
 
-                if !self.is_copy(&ty) {
+                // Only move if:
+                // 1. type is non-copy
+                // 2. variable is NOT a borrow binding
+                // 3. variable is NOT borrowed by someone else
+                let is_borrow = _tcx.borrows.contains_key(&id);
+
+                if !self.is_copy(&ty) && !is_borrow {
                     self.scope.insert(id, (false, ty));
                 }
 
@@ -283,6 +307,52 @@ impl BorrowChecker {
             }
 
             Expr::Cast(_, inner) => self.check_expr(inner, _tcx),
+            Expr::Borrow(inner) => {
+                // Borrow is a READ-ONLY access
+                // It must not move the underlying value
+                match &inner.node {
+                    Expr::Var(name, Some(id)) => {
+                        let (alive, _ty) = self.scope.get(id).cloned().ok_or(Diagnostic {
+                            error: CheckError::UndefinedVariable { var: name.clone() },
+                            span: inner.span,
+                        })?;
+
+                        if !alive {
+                            return Err(Diagnostic {
+                                error: CheckError::UseAfterMove { var: name.clone() },
+                                span: inner.span,
+                            });
+                        }
+
+                        // DO NOT move, even if non-copy
+                        Ok(())
+                    }
+                    _ => {
+                        // Borrowing a complex expression is fine
+                        self.check_expr(inner, _tcx)
+                    }
+                }
+            }
+            Expr::Update { base, index, value } => {
+                // base is READ-ONLY
+                self.check_expr(base, _tcx)?;
+
+                if let Some(i) = index {
+                    self.check_expr(i, _tcx)?;
+                }
+                if let Some(v) = value {
+                    self.check_expr(v, _tcx)?;
+                }
+
+                // IMPORTANT: do NOT move base
+                if let Expr::Var(_, Some(id)) = &base.node {
+                    if let Some((alive, ty)) = self.scope.get(id).cloned() {
+                        self.scope.insert(*id, (alive, ty));
+                    }
+                }
+
+                Ok(())
+            }
             _ => Ok(()),
         }
     }
@@ -562,6 +632,7 @@ mod tests {
         let mut tcx = TyCtx {
             resolutions: HashMap::new(),
             node_types: HashMap::new(),
+            borrows: HashMap::new(),
         };
 
         let func = FnDecl {

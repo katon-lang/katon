@@ -110,6 +110,13 @@ fn expr_to_smt(expr: &SExpr, env: &Env, tcx: &TyCtx, smt: &mut String) -> String
 
             current_array
         }
+        Expr::Borrow(inner) => expr_to_smt(inner, env, tcx, smt),
+        Expr::Update { base, index, value } => {
+            let base_smt = expr_to_smt(base, env, tcx, smt);
+            let idx_smt = expr_to_smt(index.as_ref().unwrap(), env, tcx, smt);
+            let val_smt = expr_to_smt(value.as_ref().unwrap(), env, tcx, smt);
+            format!("(store {} {} {})", base_smt, idx_smt, val_smt)
+        }
         _ => unimplemented!(),
     }
 }

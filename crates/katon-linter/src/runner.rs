@@ -106,6 +106,7 @@ impl Linter {
 
             // Leaf expressions
             Expr::IntLit(_) | Expr::BoolLit(_) | Expr::Var(_, _) | Expr::Old(_, _) => {}
+            _ => unimplemented!(),
         }
     }
 }
