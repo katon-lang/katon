@@ -516,4 +516,153 @@ mod tests {
 
         assert!(tc.check_stmt(&stmt).is_err());
     }
+
+    #[test]
+    fn test_borrow_preserves_type() {
+        let mut tc = checker();
+        tc.tcx.node_types.insert(NodeId(1), Type::Int);
+
+        let expr = SExpr {
+            node: Expr::Borrow(Box::new(SExpr {
+                node: Expr::Var("x".to_string(), Some(NodeId(1))),
+                span: Span::dummy(),
+            })),
+            span: Span::dummy(),
+        };
+
+        let ty = tc.check_expr(&expr).unwrap();
+        assert_eq!(ty, Type::Int);
+    }
+
+    #[test]
+    fn test_borrow_array_type() {
+        let mut tc = checker();
+        tc.tcx
+            .node_types
+            .insert(NodeId(1), Type::Array(4, Box::new(Type::Nat)));
+
+        let expr = SExpr {
+            node: Expr::Borrow(Box::new(SExpr {
+                node: Expr::Var("arr".to_string(), Some(NodeId(1))),
+                span: Span::dummy(),
+            })),
+            span: Span::dummy(),
+        };
+
+        let ty = tc.check_expr(&expr).unwrap();
+        assert_eq!(ty, Type::Array(4, Box::new(Type::Nat)));
+    }
+
+    #[test]
+    fn test_update_returns_same_array_type() {
+        let mut tc = checker();
+        tc.tcx
+            .node_types
+            .insert(NodeId(1), Type::Array(3, Box::new(Type::Int)));
+
+        let expr = SExpr {
+            node: Expr::Update {
+                base: Box::new(SExpr {
+                    node: Expr::Var("a".to_string(), Some(NodeId(1))),
+                    span: Span::dummy(),
+                }),
+                index: Some(Box::new(SExpr {
+                    node: Expr::IntLit(1),
+                    span: Span::dummy(),
+                })),
+                value: Some(Box::new(SExpr {
+                    node: Expr::IntLit(42),
+                    span: Span::dummy(),
+                })),
+            },
+            span: Span::dummy(),
+        };
+
+        let ty = tc.check_expr(&expr).unwrap();
+        assert_eq!(ty, Type::Array(3, Box::new(Type::Int)));
+    }
+
+    #[test]
+    fn test_update_non_array_fails() {
+        let mut tc = checker();
+        tc.tcx.node_types.insert(NodeId(1), Type::Int);
+
+        let expr = SExpr {
+            node: Expr::Update {
+                base: Box::new(SExpr {
+                    node: Expr::Var("x".to_string(), Some(NodeId(1))),
+                    span: Span::dummy(),
+                }),
+                index: Some(Box::new(SExpr {
+                    node: Expr::IntLit(0),
+                    span: Span::dummy(),
+                })),
+                value: Some(Box::new(SExpr {
+                    node: Expr::IntLit(1),
+                    span: Span::dummy(),
+                })),
+            },
+            span: Span::dummy(),
+        };
+
+        let err = tc.check_expr(&expr).unwrap_err();
+        assert!(matches!(err.error, CheckError::InvalidIndex { .. }));
+    }
+
+    #[test]
+    fn test_update_wrong_value_type_fails() {
+        let mut tc = checker();
+        tc.tcx
+            .node_types
+            .insert(NodeId(1), Type::Array(2, Box::new(Type::Bool)));
+
+        let expr = SExpr {
+            node: Expr::Update {
+                base: Box::new(SExpr {
+                    node: Expr::Var("a".to_string(), Some(NodeId(1))),
+                    span: Span::dummy(),
+                }),
+                index: Some(Box::new(SExpr {
+                    node: Expr::IntLit(0),
+                    span: Span::dummy(),
+                })),
+                value: Some(Box::new(SExpr {
+                    node: Expr::IntLit(1), // ❌ should be Bool
+                    span: Span::dummy(),
+                })),
+            },
+            span: Span::dummy(),
+        };
+
+        let err = tc.check_expr(&expr).unwrap_err();
+        assert!(matches!(err.error, CheckError::TypeMismatch { .. }));
+    }
+
+    #[test]
+    fn test_update_index_must_be_integer() {
+        let mut tc = checker();
+        tc.tcx
+            .node_types
+            .insert(NodeId(1), Type::Array(2, Box::new(Type::Int)));
+
+        let expr = SExpr {
+            node: Expr::Update {
+                base: Box::new(SExpr {
+                    node: Expr::Var("a".to_string(), Some(NodeId(1))),
+                    span: Span::dummy(),
+                }),
+                index: Some(Box::new(SExpr {
+                    node: Expr::BoolLit(true),
+                    span: Span::dummy(),
+                })),
+                value: Some(Box::new(SExpr {
+                    node: Expr::IntLit(0),
+                    span: Span::dummy(),
+                })),
+            },
+            span: Span::dummy(),
+        };
+
+        assert!(tc.check_expr(&expr).is_err());
+    }
 }

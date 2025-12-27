@@ -3,8 +3,7 @@ use std::collections::HashMap;
 use katon_core::ast::{Expr, FnDecl, NodeId, SExpr, SStmt, Stmt, Type};
 use katon_core::errors::{CheckError, Diagnostic};
 
-// Symbol table implementation to make the assignment know
-// what data type is passing
+// Symbol table implementation to make the assignment know what data type is passing
 // resolution: Maps a specific occurrence in code to a definition
 // node_types: Maps a definition to its type
 pub struct TyCtx {
@@ -433,5 +432,178 @@ mod tests {
         } else {
             panic!("NodeId was not populated for array length");
         }
+    }
+
+    #[test]
+    fn test_resolve_borrow_variable() {
+        let mut resolver = Resolver::new();
+
+        let mut let_x = SStmt {
+            node: Stmt::Let {
+                name: "x".to_string(),
+                id: None,
+                ty: None,
+                value: Some(SExpr {
+                    node: Expr::IntLit(1),
+                    span: dummy_span(),
+                }),
+            },
+            span: dummy_span(),
+        };
+
+        resolver.resolve_stmt(&mut let_x).unwrap();
+
+        let x_id = match let_x.node {
+            Stmt::Let { id: Some(id), .. } => id,
+            _ => panic!("expected let"),
+        };
+
+        // let y = &x;
+        let mut let_y = SStmt {
+            node: Stmt::Let {
+                name: "y".to_string(),
+                id: None,
+                ty: None,
+                value: Some(SExpr {
+                    node: Expr::Borrow(Box::new(SExpr {
+                        node: Expr::Var("x".to_string(), None),
+                        span: dummy_span(),
+                    })),
+                    span: dummy_span(),
+                }),
+            },
+            span: dummy_span(),
+        };
+
+        resolver.resolve_stmt(&mut let_y).unwrap();
+
+        // Assert borrow inner resolved to x_id
+        if let Stmt::Let {
+            value: Some(expr), ..
+        } = &let_y.node
+        {
+            if let Expr::Borrow(inner) = &expr.node {
+                if let Expr::Var(_, Some(id)) = inner.node {
+                    assert_eq!(id, x_id);
+                } else {
+                    panic!("borrow inner not resolved");
+                }
+            } else {
+                panic!("expected borrow expr");
+            }
+        }
+    }
+
+    #[test]
+    fn test_resolve_update_expression() {
+        let mut resolver = Resolver::new();
+
+        // let a = [1, 2];
+        let mut let_a = SStmt {
+            node: Stmt::Let {
+                name: "a".to_string(),
+                id: None,
+                ty: None,
+                value: Some(SExpr {
+                    node: Expr::ArrayLit(vec![
+                        SExpr {
+                            node: Expr::IntLit(1),
+                            span: dummy_span(),
+                        },
+                        SExpr {
+                            node: Expr::IntLit(2),
+                            span: dummy_span(),
+                        },
+                    ]),
+                    span: dummy_span(),
+                }),
+            },
+            span: dummy_span(),
+        };
+
+        resolver.resolve_stmt(&mut let_a).unwrap();
+
+        let a_id = match let_a.node {
+            Stmt::Let { id: Some(id), .. } => id,
+            _ => panic!("expected let"),
+        };
+
+        // let b = update(a, 0, 42);
+        let mut let_b = SStmt {
+            node: Stmt::Let {
+                name: "b".to_string(),
+                id: None,
+                ty: None,
+                value: Some(SExpr {
+                    node: Expr::Update {
+                        base: Box::new(SExpr {
+                            node: Expr::Var("a".to_string(), None),
+                            span: dummy_span(),
+                        }),
+                        index: Some(Box::new(SExpr {
+                            node: Expr::IntLit(0),
+                            span: dummy_span(),
+                        })),
+                        value: Some(Box::new(SExpr {
+                            node: Expr::IntLit(42),
+                            span: dummy_span(),
+                        })),
+                    },
+                    span: dummy_span(),
+                }),
+            },
+            span: dummy_span(),
+        };
+
+        resolver.resolve_stmt(&mut let_b).unwrap();
+
+        // Assert update base resolved to a_id
+        if let Stmt::Let {
+            value: Some(expr), ..
+        } = &let_b.node
+        {
+            if let Expr::Update { base, .. } = &expr.node {
+                if let Expr::Var(_, Some(id)) = base.node {
+                    assert_eq!(id, a_id);
+                } else {
+                    panic!("update base not resolved");
+                }
+            } else {
+                panic!("expected update expr");
+            }
+        }
+    }
+
+    #[test]
+    fn test_borrow_does_not_define_variable() {
+        let mut resolver = Resolver::new();
+
+        let mut stmt = SStmt {
+            node: Stmt::Let {
+                name: "x".to_string(),
+                id: None,
+                ty: None,
+                value: Some(SExpr {
+                    node: Expr::Borrow(Box::new(SExpr {
+                        node: Expr::IntLit(1),
+                        span: dummy_span(),
+                    })),
+                    span: dummy_span(),
+                }),
+            },
+            span: dummy_span(),
+        };
+
+        resolver.resolve_stmt(&mut stmt).unwrap();
+
+        // Only x should be defined
+        let x_id = match stmt.node {
+            Stmt::Let { id: Some(id), .. } => id,
+            _ => panic!("expected let"),
+        };
+
+        assert!(resolver.resolve("x").is_some());
+        assert!(resolver.resolve("borrow").is_none());
+        assert_eq!(resolver.resolve("x"), Some(x_id));
     }
 }

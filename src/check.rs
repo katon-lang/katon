@@ -335,20 +335,29 @@ impl BorrowChecker {
             }
             Expr::Update { base, index, value } => {
                 // base is READ-ONLY
-                self.check_expr(base, _tcx)?;
+                match &base.node {
+                    Expr::Var(name, Some(id)) => {
+                        let (alive, _) = self.scope.get(id).cloned().ok_or(Diagnostic {
+                            error: CheckError::UndefinedVariable { var: name.clone() },
+                            span: base.span,
+                        })?;
+
+                        if !alive {
+                            return Err(Diagnostic {
+                                error: CheckError::UseAfterMove { var: name.clone() },
+                                span: base.span,
+                            });
+                        }
+                    }
+                    _ => self.check_expr(base, _tcx)?,
+                }
 
                 if let Some(i) = index {
                     self.check_expr(i, _tcx)?;
                 }
+
                 if let Some(v) = value {
                     self.check_expr(v, _tcx)?;
-                }
-
-                // IMPORTANT: do NOT move base
-                if let Expr::Var(_, Some(id)) = &base.node
-                    && let Some((alive, ty)) = self.scope.get(id).cloned()
-                {
-                    self.scope.insert(*id, (alive, ty));
                 }
 
                 Ok(())
@@ -715,5 +724,189 @@ mod tests {
                 var: "arr".to_string()
             }
         );
+    }
+
+    #[test]
+    fn test_borrow_does_not_move_variable() {
+        let mut bc = BorrowChecker::new();
+        let mut tcx = TyCtx::new();
+
+        let x = NodeId(1);
+        let y = NodeId(2);
+
+        let arr_ty = Type::Array(10, Box::new(Type::Int));
+
+        tcx.define_local(x, "x", arr_ty.clone());
+        tcx.define_local(y, "y", arr_ty.clone());
+
+        bc.scope.insert(x, (true, arr_ty.clone()));
+
+        let stmt = SStmt {
+            node: Stmt::Let {
+                id: Some(y),
+                name: "y".into(),
+                ty: None,
+                value: Some(SExpr {
+                    node: Expr::Borrow(Box::new(SExpr {
+                        node: Expr::Var("x".into(), Some(x)),
+                        span: Span::dummy(),
+                    })),
+                    span: Span::dummy(),
+                }),
+            },
+            span: Span::dummy(),
+        };
+
+        assert!(bc.check_stmt(&stmt, &mut tcx).is_ok());
+
+        // x must remain alive after borrow
+        assert!(bc.scope.get(&x).unwrap().0);
+    }
+
+    #[test]
+    fn test_non_copy_read_moves_variable() {
+        let mut bc = BorrowChecker::new();
+        let mut tcx = TyCtx::new();
+
+        let x = NodeId(1);
+        tcx.node_types
+            .insert(x, Type::Array(10, Box::new(Type::Int)));
+
+        bc.scope.insert(x, (true, tcx.node_types[&x].clone()));
+
+        let expr = SExpr {
+            node: Expr::Var("x".into(), Some(x)),
+            span: Span::dummy(),
+        };
+
+        assert!(bc.check_expr(&expr, &tcx).is_ok());
+
+        // x is moved
+        assert!(!bc.scope.get(&x).unwrap().0);
+    }
+
+    #[test]
+    fn test_use_after_move_fails() {
+        let mut bc = BorrowChecker::new();
+        let mut tcx = TyCtx::new();
+
+        let x = NodeId(1);
+        tcx.node_types
+            .insert(x, Type::Array(10, Box::new(Type::Int)));
+
+        bc.scope.insert(x, (false, tcx.node_types[&x].clone()));
+
+        let expr = SExpr {
+            node: Expr::Var("x".into(), Some(x)),
+            span: Span::dummy(),
+        };
+
+        let err = bc.check_expr(&expr, &tcx).unwrap_err();
+        assert!(matches!(err.error, CheckError::UseAfterMove { .. }));
+    }
+
+    #[test]
+    fn test_update_is_pure_and_does_not_move_base() {
+        let mut bc = BorrowChecker::new();
+        let mut tcx = TyCtx::new();
+
+        let x = NodeId(1);
+        tcx.node_types
+            .insert(x, Type::Array(10, Box::new(Type::Int)));
+
+        bc.scope.insert(x, (true, tcx.node_types[&x].clone()));
+
+        let expr = SExpr {
+            node: Expr::Update {
+                base: Box::new(SExpr {
+                    node: Expr::Var("x".into(), Some(x)),
+                    span: Span::dummy(),
+                }),
+                index: Some(Box::new(SExpr {
+                    node: Expr::IntLit(0),
+                    span: Span::dummy(),
+                })),
+                value: Some(Box::new(SExpr {
+                    node: Expr::IntLit(42),
+                    span: Span::dummy(),
+                })),
+            },
+            span: Span::dummy(),
+        };
+
+        assert!(bc.check_expr(&expr, &tcx).is_ok());
+
+        // x remains alive
+        assert!(bc.scope.get(&x).unwrap().0);
+    }
+
+    #[test]
+    fn test_assign_to_borrowed_variable_fails() {
+        let mut bc = BorrowChecker::new();
+        let mut tcx = TyCtx::new();
+
+        let x = NodeId(1);
+        tcx.node_types
+            .insert(x, Type::Array(10, Box::new(Type::Int)));
+        tcx.borrows.insert(x, NodeId(99)); // fake borrow owner
+
+        bc.scope.insert(x, (true, tcx.node_types[&x].clone()));
+
+        let stmt = SStmt {
+            node: Stmt::Assign {
+                target: "x".into(),
+                target_id: Some(x),
+                value: SExpr {
+                    node: Expr::IntLit(1),
+                    span: Span::dummy(),
+                },
+            },
+            span: Span::dummy(),
+        };
+
+        let err = bc.check_stmt(&stmt, &mut tcx).unwrap_err();
+        assert!(matches!(err.error, CheckError::AssignToMoved { .. }));
+    }
+
+    #[test]
+    fn test_move_in_one_branch_kills_variable_after_if() {
+        let mut bc = BorrowChecker::new();
+        let mut tcx = TyCtx::new();
+
+        let x = NodeId(1);
+        let y = NodeId(2);
+
+        let arr_ty = Type::Array(10, Box::new(Type::Int));
+
+        tcx.define_local(x, "x", arr_ty.clone());
+        tcx.define_local(y, "y", arr_ty.clone());
+
+        bc.scope.insert(x, (true, arr_ty.clone()));
+
+        let stmt = SStmt {
+            node: Stmt::If {
+                cond: SExpr {
+                    node: Expr::BoolLit(true),
+                    span: Span::dummy(),
+                },
+                then_block: vec![SStmt {
+                    node: Stmt::Let {
+                        id: Some(y),
+                        name: "y".into(),
+                        ty: None,
+                        value: Some(SExpr {
+                            node: Expr::Var("x".into(), Some(x)),
+                            span: Span::dummy(),
+                        }),
+                    },
+                    span: Span::dummy(),
+                }],
+                else_block: vec![],
+            },
+            span: Span::dummy(),
+        };
+
+        assert!(bc.check_stmt(&stmt, &mut tcx).is_ok());
+        assert!(!bc.scope.get(&x).unwrap().0);
     }
 }

@@ -164,6 +164,19 @@ fn type_to_smt(ty: &Type) -> String {
     }
 }
 
+fn infer_expr_type(expr: &SExpr, env: &Env) -> Option<Type> {
+    match &expr.node {
+        Expr::Update { base, .. } => {
+            if let Expr::Var(_, Some(id)) = &base.node {
+                env.var_types.get(id).cloned()
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
 fn process_block(
     stmts: &[SStmt],
     env: Env,
@@ -197,8 +210,25 @@ fn process_block(
                 smt.push_str(&format!("(assert (= {} {}))\n", name, val_smt));
                 env = env2;
             }
-            Stmt::Let { value, id, .. } => {
+            Stmt::Let { value, id, ty, .. } => {
                 let id = id.expect("Resolver must assign ID");
+
+                // --- Case 1: let y = &x; (transparent borrow)
+                if ty.is_none()
+                    && let Some(expr) = value
+                    && matches!(expr.node, Expr::Borrow(_))
+                {
+                    continue;
+                }
+
+                // --- Case 2: let y = update(x, ...)
+                if ty.is_none()
+                    && let Some(expr) = value
+                    && let Some(inferred) = infer_expr_type(expr, &env)
+                {
+                    env.var_types.insert(id, inferred);
+                }
+
                 let ty_obj = env.var_types.get(&id).expect("Type missing in env");
 
                 if let Some(expr) = value {
@@ -228,6 +258,23 @@ fn process_block(
                         type_to_smt(ty_obj)
                     ));
                     smt.push_str(&format!("(assert (= {} {}))\n", name, val_smt));
+
+                    // --- Safety Check: Functional Update Bounds ---
+                    if let Expr::Update { base, index, .. } = &expr.node
+                        && let Expr::Var(name, Some(_)) = &base.node
+                    {
+                        let idx_smt = expr_to_smt(index.as_ref().unwrap(), &env, tcx, smt);
+                        let len_name = format!("{}_length", name);
+
+                        let bounds_check = format!(
+                            "{smt}\n(assert (not (and (>= {idx} 0) (< {idx} {len}))))\n(check-sat)",
+                            smt = smt,
+                            idx = idx_smt,
+                            len = len_name
+                        );
+
+                        vcs.push(bounds_check);
+                    }
                 } else {
                     // --- CASE: let x: type; ---
                     // We don't declare a version yet (version remains 0).
@@ -663,5 +710,97 @@ mod tests {
         assert!(smt.contains(&"(declare-const arr_2 (Array Int Int))".to_string()));
         assert!(smt.contains(&"(= arr_2 (store arr_1 0 99))".to_string()));
         assert!(smt.contains(&"(select arr_2 0)".to_string()));
+    }
+
+    #[test]
+    fn test_vcgen_borrow_is_transparent() {
+        let x = NodeId(0);
+
+        let mut tcx = TyCtx::new();
+        tcx.define_local(x, "x", Type::Array(10, Box::new(Type::Int)));
+
+        let func = FnDecl {
+            name: "borrow_test".into(),
+            span: Span::dummy(),
+            param_names: vec!["x".into()],
+            params: vec![(x, Type::Array(10, Box::new(Type::Int)))],
+            requires: vec![],
+            ensures: vec![],
+            body: vec![SStmt {
+                node: Stmt::Let {
+                    id: Some(NodeId(1)),
+                    name: "y".into(),
+                    ty: None,
+                    value: Some(SExpr {
+                        node: Expr::Borrow(Box::new(SExpr {
+                            node: Expr::Var("x".into(), Some(x)),
+                            span: Span::dummy(),
+                        })),
+                        span: Span::dummy(),
+                    }),
+                },
+                span: Span::dummy(),
+            }],
+        };
+
+        let vcs = compile(&func, &tcx);
+
+        // Borrow creates no VCs
+        assert!(vcs.is_empty());
+    }
+
+    #[test]
+    fn test_vcgen_update_is_pure_functional() {
+        let x = NodeId(0);
+
+        let mut tcx = TyCtx::new();
+        tcx.define_local(x, "x", Type::Array(10, Box::new(Type::Int)));
+
+        let func = FnDecl {
+            name: "update_test".into(),
+            span: Span::dummy(),
+            param_names: vec!["x".into()],
+            params: vec![(x, Type::Array(10, Box::new(Type::Int)))],
+            requires: vec![],
+            ensures: vec![],
+            body: vec![SStmt {
+                node: Stmt::Let {
+                    id: Some(NodeId(1)),
+                    name: "y".into(),
+                    ty: None,
+                    value: Some(SExpr {
+                        node: Expr::Update {
+                            base: Box::new(SExpr {
+                                node: Expr::Var("x".into(), Some(x)),
+                                span: Span::dummy(),
+                            }),
+                            index: Some(Box::new(SExpr {
+                                node: Expr::IntLit(0),
+                                span: Span::dummy(),
+                            })),
+                            value: Some(Box::new(SExpr {
+                                node: Expr::IntLit(42),
+                                span: Span::dummy(),
+                            })),
+                        },
+                        span: Span::dummy(),
+                    }),
+                },
+                span: Span::dummy(),
+            }],
+        };
+
+        let vcs = compile(&func, &tcx);
+
+        // VC must include bounds check
+        assert_eq!(vcs.len(), 1);
+
+        let vc = &vcs[0];
+
+        // Must use SMT store
+        assert!(vc.contains("(store"));
+
+        // Base array name must appear (x_1 or similar)
+        assert!(vc.contains("x_"));
     }
 }
